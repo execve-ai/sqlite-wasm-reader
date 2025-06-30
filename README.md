@@ -98,12 +98,18 @@ fn extract_table_data(db_path: &str, table_name: &str) -> Result<Vec<Row>, Error
 - ✅ Process large databases with memory constraints
 - ✅ Integrate SQLite reading into data pipelines
 
-**Consider alternatives when you need:**
-- ❌ Write operations (use `rusqlite` or `sqlx` instead)
-- ❌ Full SQL query support (use `rusqlite` for complex queries)
-- ❌ Transaction management
-- ❌ Database creation or schema modification
-- ❌ Real-time database updates
+## Why Writing from WASM Sandboxes is Problematic
+
+This library is intentionally read-only because writing to SQLite from WebAssembly sandboxes presents significant risks:
+
+### **Data Corruption from Concurrent Writes**
+- **Multiple WASM Instances**: When multiple WebAssembly instances write to the same SQLite database simultaneously, they can corrupt the database structure
+- **No File Locking**: WASI environments often lack proper file locking mechanisms that SQLite relies on for write safety
+
+### **Technical Limitations**
+- **WAL Mode Issues**: SQLite's Write-Ahead Logging requires coordination of multiple files that may not be available in sandboxed environments
+- **Shared Memory Problems**: SQLite's locking mechanisms rely on shared memory regions that may not be properly isolated in WASM
+- **Partial Writes**: If a WASM instance crashes during a write operation, the database can be left in an inconsistent state
 
 ## Installation
 
