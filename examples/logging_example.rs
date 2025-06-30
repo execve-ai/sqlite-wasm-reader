@@ -1,4 +1,4 @@
-//! Example demonstrating database operations and logging in sqlite-wasm-reader
+//! Example demonstrating database operations and logging in sqlite_wasm_reader
 //! 
 //! This example shows how to use the library to read SQLite databases
 //! and handle different data types with comprehensive logging.

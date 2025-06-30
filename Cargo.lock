@@ -1390,7 +1390,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sqlite-wasm-reader"
+name = "sqlite_wasm_reader"
 version = "0.1.0"
 dependencies = [
  "byteorder",

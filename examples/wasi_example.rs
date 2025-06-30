@@ -1,4 +1,4 @@
-//! WASI-compatible example for sqlite-wasm-reader
+//! WASI-compatible example for sqlite_wasm_reader
 //! 
 //! This example can be compiled to WASI and run with wasmtime:
 //! cargo build --example wasi_example --target wasm32-wasip1

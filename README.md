@@ -1,4 +1,4 @@
-# sqlite-wasm-reader
+# sqlite_wasm_reader
 
 A pure Rust SQLite reader library designed for WASI (WebAssembly System Interface) environments. This library provides read-only access to SQLite databases without any C dependencies, making it perfect for WebAssembly applications running in WasmTime or other WASI-compatible runtimes.
 
@@ -117,7 +117,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sqlite-wasm-reader = "0.1.0"
+sqlite_wasm_reader = "0.1.0"
 ```
 
 ## Quick Start

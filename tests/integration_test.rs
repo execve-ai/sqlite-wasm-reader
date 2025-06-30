@@ -1,4 +1,4 @@
-//! Integration tests for sqlite-wasm-reader
+//! Integration tests for sqlite_wasm_reader
 
 use sqlite_wasm_reader::{Database, Error, Value};
 use std::fs;

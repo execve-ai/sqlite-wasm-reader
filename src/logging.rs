@@ -1,4 +1,4 @@
-//! Logging functionality for sqlite-wasm-reader
+//! Logging functionality for sqlite_wasm_reader
 
 use std::sync::Mutex;
 
@@ -75,7 +75,7 @@ impl Logger {
                 LogLevel::Debug => "DEBUG",
                 LogLevel::Trace => "TRACE",
             };
-            eprintln!("[sqlite-wasm-reader] {}: {}", prefix, message);
+            eprintln!("[sqlite_wasm_reader] {}: {}", prefix, message);
         }
     }
     

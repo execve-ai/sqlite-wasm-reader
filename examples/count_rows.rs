@@ -1,4 +1,4 @@
-//! Example demonstrating efficient row counting in sqlite-wasm-reader
+//! Example demonstrating efficient row counting in sqlite_wasm_reader
 //! 
 //! This example shows how to use the count_table_rows method to efficiently
 //! count rows in tables without loading all data into memory.
