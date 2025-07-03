@@ -37,6 +37,12 @@ pub enum Error {
     
     #[error("Invalid varint")]
     InvalidVarint,
+    
+    #[error("SQL query error: {0}")]
+    QueryError(String),
+    
+    #[error("Column not found: {0}")]
+    ColumnNotFound(String),
 }
 
 #[cfg(test)]
