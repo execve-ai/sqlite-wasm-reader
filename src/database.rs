@@ -7,6 +7,7 @@ use crate::{
     btree::BTreeCursor,
     record::parse_record,
     logging::{log_error, log_warn, log_info, log_debug},
+    query::SelectQuery,
 };
 use byteorder::{BigEndian, ByteOrder};
 use std::fs::File;
@@ -399,6 +400,30 @@ impl Database {
         
         log_debug(&format!("Successfully read {} rows from table {} ({} errors)", row_count, table_name, error_count));
         Ok(rows)
+    }
+
+    /// Execute a SELECT SQL query
+    pub fn execute_query(&mut self, query: &SelectQuery) -> Result<Vec<Row>> {
+        log_debug(&format!("Executing SELECT query on table: {}", query.table));
+        
+        // First, read all rows from the specified table
+        let rows = self.read_table(&query.table)?;
+        log_debug(&format!("Read {} total rows from table {}", rows.len(), query.table));
+        
+        // Get column information for the table
+        let columns = self.get_table_columns(&query.table)?;
+        
+        // Execute the query against the rows
+        let result = query.execute(rows, &columns)?;
+        
+        log_debug(&format!("Query returned {} rows after filtering", result.len()));
+        Ok(result)
+    }
+    
+    /// Execute a SELECT SQL query from a string
+    pub fn execute_sql(&mut self, sql: &str) -> Result<Vec<Row>> {
+        let query = SelectQuery::parse(sql)?;
+        self.execute_query(&query)
     }
 }
 

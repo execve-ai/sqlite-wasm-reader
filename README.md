@@ -2,6 +2,12 @@
 
 A pure Rust SQLite reader library designed for WASI (WebAssembly System Interface) environments. This library provides read-only access to SQLite databases without any C dependencies, making it perfect for WebAssembly applications running in WasmTime or other WASI-compatible runtimes.
 
+## Version 0.2.0
+
+This version introduces comprehensive SQL query support with enhanced WHERE clause capabilities including logical operators (`AND`, `OR`, `NOT`), null checks (`IS NULL`, `IS NOT NULL`), membership testing (`IN`), range queries (`BETWEEN`), and complex expressions with parentheses.
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed release information.
+
 ## Features
 
 - **Pure Rust Implementation**: No C dependencies, fully written in Rust
@@ -117,7 +123,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sqlite_wasm_reader = "0.1.0"
+sqlite_wasm_reader = "0.2.0"
 ```
 
 ## Quick Start
@@ -188,6 +194,39 @@ let rows = db.read_table_limited("table_name", 1000)?;
 
 // Count rows in a table efficiently
 let count = db.count_table_rows("table_name")?;
+```
+
+### SQL Query Support
+
+The library supports comprehensive SQL SELECT queries with WHERE clauses:
+
+```rust
+// Execute SQL queries
+let rows = db.execute_sql("SELECT * FROM users WHERE age > 18")?;
+
+// Complex WHERE clauses with logical operators
+let rows = db.execute_sql("SELECT * FROM users WHERE age > 18 AND status = 'active'")?;
+
+// OR conditions
+let rows = db.execute_sql("SELECT * FROM users WHERE age = 25 OR age = 30")?;
+
+// IN clauses
+let rows = db.execute_sql("SELECT * FROM users WHERE age IN (25, 30, 35)")?;
+
+// BETWEEN ranges
+let rows = db.execute_sql("SELECT * FROM users WHERE age BETWEEN 20 AND 30")?;
+
+// NULL checks
+let rows = db.execute_sql("SELECT * FROM users WHERE email IS NOT NULL")?;
+
+// Complex expressions with parentheses
+let rows = db.execute_sql("SELECT * FROM users WHERE (age > 18 OR age < 65) AND status = 'active'")?;
+
+// LIKE patterns
+let rows = db.execute_sql("SELECT * FROM users WHERE name LIKE 'John%'")?;
+
+// ORDER BY and LIMIT
+let rows = db.execute_sql("SELECT * FROM users ORDER BY age DESC LIMIT 10")?;
 ```
 
 ### Value Types
@@ -435,9 +474,3 @@ This project is licensed under Apache License, Version 2.0, ([LICENSE](LICENSE) 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-## Changelog
-
-### Version 0.1.0
-- Basic SQLite reading functionality
-- WASI-compatible implementation
