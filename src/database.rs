@@ -408,6 +408,7 @@ impl Database {
         
         // First, read all rows from the specified table
         let rows = self.read_table(&query.table)?;
+        log_debug(&format!("Read {} total rows from table {}", rows.len(), query.table));
         
         // Get column information for the table
         let columns = self.get_table_columns(&query.table)?;
@@ -415,7 +416,7 @@ impl Database {
         // Execute the query against the rows
         let result = query.execute(rows, &columns)?;
         
-        log_debug(&format!("Query returned {} rows", result.len()));
+        log_debug(&format!("Query returned {} rows after filtering", result.len()));
         Ok(result)
     }
     

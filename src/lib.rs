@@ -52,7 +52,7 @@ pub use error::{Error, Result};
 pub use database::Database;
 pub use value::Value;
 pub use logging::{Logger, LogLevel, init_default_logger, set_log_level, log_error, log_warn, log_info, log_debug, log_trace};
-pub use query::{SelectQuery, WhereCondition, ComparisonOperator, OrderBy};
+pub use query::{SelectQuery, ComparisonOperator, OrderBy};
 
 // Re-export commonly used types
 pub use format::{FileHeader, PageType};
