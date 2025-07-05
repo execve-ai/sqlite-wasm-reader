@@ -6,7 +6,7 @@ use crate::{
     page::Page,
     btree::BTreeCursor,
     record::parse_record,
-    logging::{log_error, log_warn, log_info, log_debug},
+    logging::{log_error, log_warn, log_debug},
     query::{ComparisonOperator, Expr, SelectQuery},
 };
 use byteorder::{BigEndian, ByteOrder};
@@ -27,6 +27,11 @@ pub struct Database {
     header: FileHeader,
     /// Cache of table schemas and their indexes
     schema_cache: HashMap<String, TableInfo>,
+    /// Cache of recently read pages (page_number -> Page)
+    /// Limited to prevent excessive memory usage
+    page_cache: HashMap<u32, Page>,
+    /// Maximum number of pages to cache (LRU eviction)
+    max_cache_size: usize,
 }
 
 impl Database {
@@ -49,6 +54,8 @@ impl Database {
             file, 
             header,
             schema_cache: HashMap::new(),
+            page_cache: HashMap::new(),
+            max_cache_size: 100, // Cache up to 100 pages
         };
         
         // Preload schema information
@@ -215,19 +222,45 @@ impl Database {
         })
     }
     
-    /// Read a page by number (1-indexed)
+    /// Read a page by number (1-indexed) with caching
     fn read_page(&mut self, page_number: u32) -> Result<Page> {
         if page_number == 0 || page_number > self.header.database_size {
             return Err(Error::InvalidPage(page_number));
         }
         
+        // Check cache first
+        if let Some(page) = self.page_cache.get(&page_number) {
+            return Ok(page.clone());
+        }
+        
+        // Read from disk
         let offset = (page_number - 1) as u64 * self.header.page_size as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         
         let mut data = vec![0u8; self.header.page_size as usize];
         self.file.read_exact(&mut data)?;
         
-        Page::parse(page_number, data, page_number == 1)
+        let page = Page::parse(page_number, data, page_number == 1)?;
+        
+        // Cache the page (with size limit to prevent excessive memory usage)
+        const MAX_CACHED_PAGES: usize = 100; // Limit cache to ~100 pages
+        if self.page_cache.len() >= MAX_CACHED_PAGES {
+            // Simple eviction: remove a random page
+            if let Some(&key_to_remove) = self.page_cache.keys().next() {
+                self.page_cache.remove(&key_to_remove);
+            }
+        }
+        
+        // Cache the page with LRU eviction
+        if self.page_cache.len() >= self.max_cache_size {
+            // Remove the oldest entry (simple approach: remove first key)
+            if let Some(&oldest_key) = self.page_cache.keys().next() {
+                self.page_cache.remove(&oldest_key);
+            }
+        }
+        self.page_cache.insert(page_number, page.clone());
+        
+        Ok(page)
     }
     
     /// List all tables in the database
@@ -244,72 +277,7 @@ impl Database {
             .collect())
     }
     
-    /// Read all rows from a table
-    pub fn read_table(&mut self, table_name: &str) -> Result<Vec<Row>> {
-        let schema = self.read_schema()?;
-        
-        let table_info = schema.get(table_name)
-            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-        
-        let columns = self.get_table_columns(table_name)?;
-        let root_page = match self.read_page(table_info.root_page) {
-            Ok(page) => page,
-            Err(e) => {
-                log_error(&format!("Failed to read table root page: {}", e));
-                return Err(e);
-            }
-        };
-        
-        let mut rows = Vec::new();
-        let mut cursor = BTreeCursor::new(root_page);
-        
-        // Find the index of the INTEGER PRIMARY KEY column, if any
-        let pk_column_index = columns.iter().position(|col| col == "id");
-        
-        // Safety check: limit number of rows to prevent memory issues
-        // For production sandbox systems, 10M rows should be sufficient
-        let max_rows = 10_000_000;
-        let mut row_count = 0;
-        let mut error_count = 0;
-        let max_errors = 100; // Allow some errors but not too many
-        
-        while let Some(cell) = cursor.next_cell(|page_num| self.read_page(page_num))? {
-            if row_count >= max_rows {
-                log_warn(&format!("Table too large, truncating at {} rows", max_rows));
-                break;
-            }
-            
-            if error_count >= max_errors {
-                log_warn(&format!("Too many errors while reading table, stopping at {} rows", row_count));
-                break;
-            }
-            
-            let values = match parse_record(&cell.payload) {
-                Ok(values) => values,
-                Err(e) => {
-                    log_warn(&format!("Failed to parse row {}: {}", row_count, e));
-                    error_count += 1;
-                    continue; // Skip this row and continue
-                }
-            };
-            
-            let mut row = HashMap::new();
-            for (i, column) in columns.iter().enumerate() {
-                let mut value = values.get(i).cloned().unwrap_or(Value::Null);
-                // If this is the INTEGER PRIMARY KEY column and value is Null, use the cell's key
-                if Some(i) == pk_column_index && matches!(value, Value::Null) {
-                    value = Value::Integer(cell.key);
-                }
-                row.insert(column.clone(), value);
-            }
-            
-            rows.push(row);
-            row_count += 1;
-        }
-        
-        log_debug(&format!("Successfully read {} rows from table {} ({} errors)", row_count, table_name, error_count));
-        Ok(rows)
-    }
+
     
     /// Count rows in a table efficiently without reading all data
     pub fn count_table_rows(&mut self, table_name: &str) -> Result<usize> {
@@ -448,163 +416,56 @@ impl Database {
     }
     
     /// Get column names for a table
-    fn get_table_columns(&mut self, table_name: &str) -> Result<Vec<String>> {
-        let schema = self.read_schema()?;
-        let table_info = schema.get(table_name)
+    pub fn get_table_columns(&mut self, table_name: &str) -> Result<Vec<String>> {
+        // Use cached schema instead of reading it again
+        let table_info = self.schema_cache.get(table_name)
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-        
-        // Parse CREATE TABLE statement to extract column names
-        let sql = &table_info.sql;
-        let columns = Self::parse_create_table_columns(sql)?;
-        
-        Ok(columns)
-    }
-    
-    /// Read a limited number of rows from a table
-    pub fn read_table_limited(&mut self, table_name: &str, max_rows: usize) -> Result<Vec<Row>> {
-        let schema = self.read_schema()?;
-        
-        let table_info = schema.get(table_name)
-            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-        
-        let columns = self.get_table_columns(table_name)?;
-        let root_page = match self.read_page(table_info.root_page) {
-            Ok(page) => page,
-            Err(e) => {
-                log_error(&format!("Failed to read table root page: {}", e));
-                return Err(e);
-            }
-        };
-        
-        let mut rows = Vec::new();
-        let mut cursor = BTreeCursor::new(root_page);
-        let mut row_count = 0;
-        let mut error_count = 0;
-        let max_errors = 50; // Allow some errors but not too many
-        
-        while let Some(cell) = cursor.next_cell(|page_num| self.read_page(page_num))? {
-            if row_count >= max_rows {
-                log_info(&format!("Reached limit of {} rows, stopping", max_rows));
-                break;
-            }
-            
-            if error_count >= max_errors {
-                log_warn(&format!("Too many errors while reading table, stopping at {} rows", row_count));
-                break;
-            }
-            
-            // Debug: Print the rowid to understand traversal order
-            if row_count < 10 {
-                log_debug(&format!("Processing cell with rowid: {}", cell.key));
-            }
-            
-            // Debug: Print payload information for failed rows
-            if cell.payload.len() < 10 {
-                log_debug(&format!("Cell {} has small payload: {} bytes", cell.key, cell.payload.len()));
-            }
-            
-            // Handle empty payloads (0-byte cells)
-            let values = if cell.payload.is_empty() {
-                // Empty payload means all columns are NULL
-                // We need to create NULL values for all columns
-                let mut null_values = Vec::new();
-                for _ in 0..columns.len() {
-                    null_values.push(Value::Null);
-                }
-                null_values
-            } else {
-                match parse_record(&cell.payload) {
-                    Ok(values) => values,
-                    Err(e) => {
-                        log_warn(&format!("Failed to parse row {}: {}", row_count, e));
-                        log_debug(&format!("Cell rowid: {}, payload size: {} bytes", cell.key, cell.payload.len()));
-                        if cell.payload.len() <= 100 {
-                            log_debug(&format!("Payload hex: {:?}", cell.payload));
-                        }
-                        error_count += 1;
-                        continue; // Skip this row and continue
-                    }
-                }
-            };
-            
-            let mut row = HashMap::new();
-            for (i, column) in columns.iter().enumerate() {
-                let value = values.get(i).cloned().unwrap_or(Value::Null);
-                row.insert(column.clone(), value);
-            }
-            
-            rows.push(row);
-            row_count += 1;
-        }
-        
-        log_debug(&format!("Successfully read {} rows from table {} ({} errors)", row_count, table_name, error_count));
-        Ok(rows)
+        Ok(table_info.columns.clone())
     }
     
     /// Execute a SELECT SQL query using index-based search only
     pub fn execute_query(&mut self, query: &SelectQuery) -> Result<Vec<Row>> {
-        log_debug(&format!("Executing query: {:?}", query));
-        
         let table_name = &query.table;
-        log_debug(&format!("Attempting to use index for table: {}", table_name));
-
-        // Get table info first
-        let (columns, has_where, table_info) = {
-            let table_info = self.schema_cache.get(table_name)
-                .ok_or_else(|| {
-                    log_debug(&format!("Table not found in schema cache: {}", table_name));
-                    Error::TableNotFound(table_name.clone())
-                })?;
-            log_debug(&format!("Table '{}' has {} indexes: {:?}", table_name, table_info.indexes.len(), 
-                table_info.indexes.iter().map(|i| &i.name).collect::<Vec<_>>()));
-            (table_info.columns.clone(), query.where_expr.is_some(), table_info.clone())
-        };
+        
+        // Get table info once and reuse
+        let table_info = self.schema_cache.get(table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
+        
+        let columns = table_info.columns.clone();
+        let table_info_clone = table_info.clone();
+        let has_where = query.where_expr.is_some();
 
         if !has_where {
             return Err(Error::QueryError("Query requires a WHERE clause to use index-based search".to_string()));
         }
 
         let where_expr = query.where_expr.as_ref().unwrap();
-        log_debug(&format!("Processing WHERE expression: {:?}", where_expr));
-        
         let or_branches = collect_or_branches(where_expr);
-        log_debug(&format!("Collected {} OR branches from WHERE clause", or_branches.len()));
         
         // Process each OR branch to find usable indexes
-        let mut indexed_branches = Vec::new();
-            
-        for (i, branch) in or_branches.iter().enumerate() {
-            log_debug(&format!("Processing branch {}: {:?}", i, branch));
-            if let Some((index, values)) = find_best_index(&table_info, branch) {
-                log_debug(&format!("Found suitable index '{}' for branch {} with values: {:?}", 
-                    index.name, i, values));
-                log_debug(&format!(
-                    "Will use index '{}' on columns '{:?}' with values: {:?}",
-                    index.name, index.columns, values
-                ));
-                // Clone the values to avoid reference issues
-                let owned_values = values.into_iter().cloned().collect();
-                indexed_branches.push((index.clone(), owned_values));
-            } else {
-                log_debug("No suitable index found for a branch");
+        let mut all_rowids = std::collections::HashSet::new();
+        
+        for branch in or_branches.iter() {
+            if let Some((index, values)) = find_best_index(&table_info_clone, branch) {
+                // Process this index branch directly
+                let index_root_page = self.read_page(index.root_page)?;
+                let mut cursor = BTreeCursor::new(index_root_page);
+                
+                // Convert Vec<&Value> to Vec<&Value> for find_rowids_by_key
+                let value_refs: Vec<&Value> = values.iter().map(|&v| v).collect();
+                let page_reader = |page_num: u32| self.read_page(page_num);
+                let rowids = cursor.find_rowids_by_key(&value_refs, page_reader)?;
+                all_rowids.extend(rowids);
             }
         }
         
-        log_debug(&format!("Found {} branches that can use an index", indexed_branches.len()));
-        
         // If no branches could use an index, return an error
-        if indexed_branches.is_empty() {
+        if all_rowids.is_empty() {
             return Err(Error::QueryError("No suitable index found for the query conditions".to_string()));
         }
 
-        // Process the indexed branches to get rowids
-        log_debug("Processing indexed branches to find matching rowids...");
-        let all_rowids = self.process_indexed_branches(indexed_branches)?;
-        log_debug(&format!("Found {} unique rowids from index scans", all_rowids.len()));
-
         // If no matching rows are found, return an empty result immediately
         if all_rowids.is_empty() {
-            log_debug("No matching rows found in any index, returning empty result");
             return Ok(Vec::new());
         }
 
@@ -619,42 +480,16 @@ impl Database {
             }
         }
 
-        // Get fresh table info to avoid borrow issues
-        let table_info = self.schema_cache.get(table_name)
-            .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
-
         // When using an index, we trust that the index has already filtered the rows correctly.
         // We should NOT apply the WHERE clause again, only apply ORDER BY, column selection, and LIMIT.
         let mut result_query = query.clone();
         result_query.where_expr = None; // Remove WHERE clause since index already filtered
         
-        let result = result_query.execute(rows, &table_info.columns)?;
-        log_debug(&format!("Query executed using index, found {} rows", result.len()));
+        let result = result_query.execute(rows, &table_info_clone.columns)?;
         Ok(result)
     }
     
 
-
-    // Process the indexed branches after extracting the necessary information
-    fn process_indexed_branches(
-        &mut self,
-        indexed_branches: Vec<(IndexInfo, Vec<Value>)>,
-    ) -> Result<std::collections::HashSet<i64>> {
-        let mut all_rowids = std::collections::HashSet::new();
-
-        for (index, values) in indexed_branches {
-            let index_root_page = self.read_page(index.root_page)?;
-            let mut cursor = BTreeCursor::new(index_root_page);
-            
-            // Convert Vec<Value> to Vec<&Value> for find_rowids_by_key
-            let value_refs: Vec<&Value> = values.iter().collect();
-            let page_reader = |page_num: u32| self.read_page(page_num);
-            let rowids = cursor.find_rowids_by_key(&value_refs, page_reader)?;
-            all_rowids.extend(rowids);
-        }
-
-        Ok(all_rowids)
-    }
 } // end impl Database
 
 /// Collect all branches of an OR expression.
@@ -679,35 +514,23 @@ fn find_best_index<'a, 'b>(
     table_info: &'a TableInfo,
     expr: &'b Expr,
 ) -> Option<(&'a IndexInfo, Vec<&'b Value>)> {
-    log_debug(&format!("Finding best index for expression: {:?}", expr));
-    
     let mut conditions = HashMap::new();
     collect_and_conditions(expr, &mut conditions);
-    
-    log_debug(&format!("Extracted conditions: {:?}", 
-        conditions.iter().map(|(k, v)| (k, *v)).collect::<HashMap<_, _>>()));
-    log_debug(&format!("Available indexes: {:?}", 
-        table_info.indexes.iter().map(|i| (i.name.clone(), i.columns.clone())).collect::<Vec<_>>()));
 
     let mut best_index: Option<(&'a IndexInfo, Vec<&'b Value>)> = None;
     let mut max_len = 0;
 
     for index in &table_info.indexes {
-        log_debug(&format!("Checking index on columns: {:?}", index.columns));
         let mut values = Vec::new();
-        let mut prefix_matched = true;
 
         // For composite indexes, we can use prefix matching
         // We need consecutive columns starting from the first column
         for col in &index.columns {
             match conditions.get(col) {
                 Some(value) => {
-                    log_debug(&format!("  - Column '{}' matches condition with value: {:?}", col, value));
                     values.push(*value);
                 }
                 None => {
-                    log_debug(&format!("  - Column '{}' missing -> stopping prefix match here", col));
-                    prefix_matched = false;
                     break;
                 }
             }
@@ -715,78 +538,51 @@ fn find_best_index<'a, 'b>(
 
         // We can use an index if we have at least one matching column from the prefix
         if !values.is_empty() {
-            if prefix_matched {
-                log_debug(&format!("✔️  Index '{}' fully satisfies equality conditions", index.name));
-            } else {
-                log_debug(&format!("✔️  Index '{}' supports prefix matching with {} columns", index.name, values.len()));
-            }
-            
             // Prefer the index that covers the most columns (ties resolved arbitrarily)
             if values.len() > max_len {
-                 log_debug(&format!("  ★ New best index: '{}' with {} matching columns", 
-                     index.name, values.len()));
                 best_index = Some((index, values.clone()));
                 max_len = values.len();
-            } else {
-                log_debug(&format!("  ✓ Index '{}' has {} matching columns (current best: {})", 
-                    index.name, values.len(), max_len));
             }
-        } else {
-            log_debug(&format!("  ✗ Index '{}' has no matching columns", index.name));
         }
     }
 
-    if let Some((index, values)) = &best_index {
-        log_debug(&format!("\nSelected index: '{}' on columns: {:?} with values: {:?}", 
-            index.name, index.columns, values));
-    } else {
-        log_debug("\nNo suitable index found for the conditions");
-    }
+
 
     best_index
 }
 
 /// Collect all equality conditions from an AND expression tree.
 fn collect_and_conditions<'b>(expr: &'b Expr, conditions: &mut HashMap<String, &'b Value>) {
-    log_debug(&format!("Processing expression: {:?}", expr));
-    
     match expr {
         Expr::And(left, right) => {
-            log_debug("Processing AND expression");
             collect_and_conditions(left, conditions);
             collect_and_conditions(right, conditions);
         }
-        Expr::Or(left, right) => {
-            log_debug("Processing OR expression");
+        Expr::Or(_, _) => {
             // For OR expressions, we need to handle them at a higher level
-            // Just log them for now and let the caller handle them
-            log_debug(&format!("Found OR expression between {:?} and {:?}", left, right));
+            // Just skip them for now and let the caller handle them
         }
-        Expr::Not(inner) => {
-            log_debug("Processing NOT expression");
-            log_debug(&format!("Found NOT expression: {:?}", inner));
+        Expr::Not(_) => {
+            // Skip NOT expressions for now
         }
         Expr::Comparison { column, operator, value } => {
             match operator {
                 ComparisonOperator::Equal => {
-                    log_debug(&format!("  ✓ Found equality condition: {} = {:?}", column, value));
                     conditions.insert(column.clone(), value);
                 },
                 _ => {
-                    log_debug(&format!("  ⚠️  Skipping non-equality condition: {} {:?} {:?}", 
-                        column, operator, value));
+                    // Skip non-equality conditions
                 }
             }
         },
-        Expr::IsNull(column) => {
-            log_debug(&format!("  ⚠️  Skipping IS NULL condition on column: {}", column));
+        Expr::IsNull(_) => {
+            // Skip IS NULL conditions
         },
-        Expr::IsNotNull(column) => {
-            log_debug(&format!("  ⚠️  Skipping IS NOT NULL condition on column: {}", column));
+        Expr::IsNotNull(_) => {
+            // Skip IS NOT NULL conditions
         },
-        Expr::In { column, values } => {
-            log_debug(&format!("  ⚠️  Skipping IN condition on column: {} with {} values", 
-                column, values.len()));
+        Expr::In { .. } => {
+            // Skip IN conditions
         }
     }
 }
@@ -796,8 +592,6 @@ fn read_row_by_rowid(db: &mut Database, table_name: &str, rowid: i64, columns: &
     // Get the table's root page from cache
     let table_info = db.schema_cache.get(table_name)
         .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-
-    log_debug(&format!("Looking for row with ROWID {} in table '{}'", rowid, table_name));
     
     let root_page = db.read_page(table_info.root_page)?;
     let mut cursor = BTreeCursor::new(root_page);
@@ -805,37 +599,28 @@ fn read_row_by_rowid(db: &mut Database, table_name: &str, rowid: i64, columns: &
     // Try to find the cell with the matching ROWID
     match cursor.find_cell(rowid, |page_num| db.read_page(page_num)) {
         Ok(Some(cell)) => {
-            log_debug(&format!("Found cell for ROWID {}, payload size: {} bytes", rowid, cell.payload.len()));
-            
             // Parse the row data
             match parse_record(&cell.payload) {
                 Ok(values) => {
-                    log_debug(&format!("Successfully parsed record with {} values", values.len()));
-                    
                     // Convert to a row with column names
                     let mut row = HashMap::new();
                     for (i, column_name) in columns.iter().enumerate() {
                         let value = values.get(i).cloned().unwrap_or(Value::Null);
-                        log_debug(&format!("  {}: {:?}", column_name, value));
                         row.insert(column_name.clone(), value);
                     }
                     
                     Ok(Some(row))
                 },
-                Err(e) => {
-                    log_debug(&format!("Failed to parse record for ROWID {}: {}", rowid, e));
-                    log_debug(&format!("Payload hex: {:?}", cell.payload));
+                Err(_) => {
                     // Return None instead of failing to allow processing to continue with other rows
                     Ok(None)
                 }
             }
         },
         Ok(None) => {
-            log_debug(&format!("No cell found for ROWID {} in table '{}'", rowid, table_name));
             Ok(None)
         },
         Err(e) => {
-            log_debug(&format!("Error finding cell for ROWID {}: {}", rowid, e));
             Err(e)
         }
     }

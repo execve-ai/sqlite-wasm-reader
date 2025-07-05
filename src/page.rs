@@ -7,7 +7,7 @@ use byteorder::{BigEndian, ByteOrder};
 use alloc::{vec::Vec, format};
 
 /// Represents a page in the SQLite database
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Page {
     /// Page number (1-indexed)

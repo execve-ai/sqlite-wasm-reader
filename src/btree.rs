@@ -131,7 +131,7 @@ impl BTreeCursor {
                 return Ok(None);
             }
             
-            let (page, cell_index, cells_processed) = self.page_stack.last_mut().unwrap();
+            let (page, cell_index, _cells_processed) = self.page_stack.last_mut().unwrap();
             
             // If this is a leaf page
             if page.page_type.is_leaf() {
@@ -271,8 +271,8 @@ impl BTreeCursor {
 
             // Continue traversal with the newly pushed page (if any)
             continue;
-
-    }}
+        }
+    }
 
     /// Find all rowids for a composite index key (exact match on all components).
     pub fn find_rowids_by_key<F>(&mut self, key: &[&Value], mut read_page: F) -> Result<Vec<i64>>

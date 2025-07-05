@@ -144,8 +144,9 @@ fn main() -> Result<(), Error> {
         println!("Table: {}", table);
     }
     
-    // Read all rows from a table
-    let rows = db.read_table("users")?;
+    // Execute a query using indexes
+    let query = SelectQuery::parse("SELECT * FROM users WHERE id = 1")?;
+    let rows = db.execute_query(&query)?;
     for row in rows {
         println!("{:?}", row);
     }
@@ -186,11 +187,9 @@ let mut db = Database::open("path/to/database.db")?;
 // List all tables
 let tables = db.tables()?;
 
-// Read all rows from a table
-let rows = db.read_table("table_name")?;
-
-// Read limited number of rows (useful for large tables)
-let rows = db.read_table_limited("table_name", 1000)?;
+// Execute a query using indexes
+let query = SelectQuery::parse("SELECT * FROM table_name WHERE column = 'value'")?;
+let rows = db.execute_query(&query)?;
 
 // Count rows in a table efficiently
 let count = db.count_table_rows("table_name")?;

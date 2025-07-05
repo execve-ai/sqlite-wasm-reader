@@ -13,7 +13,7 @@ readme = "README.md"
 
 [dependencies]
 byteorder = "1.5.0"
-sqlparser = "0.57.0"
+sqlparser = { version = "0.57.0", default-features = false }
 thiserror = "2.0.12"
 
 [dev-dependencies]

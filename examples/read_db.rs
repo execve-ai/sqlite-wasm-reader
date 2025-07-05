@@ -39,30 +39,28 @@ fn main() -> Result<(), Error> {
             }
         }
         
-        match db.read_table(&table) {
+        // Show columns for the table
+        match db.get_table_columns(&table) {
+            Ok(columns) => {
+                println!("  Columns: {}", columns.join(", "));
+            }
+            Err(e) => {
+                println!("  Error getting columns: {}", e);
+            }
+        }
+        
+        // Try to execute a query to get sample data
+        match db.execute_query(&sqlite_wasm_reader::SelectQuery::parse(&format!("SELECT * FROM {} LIMIT 10", table))?) {
             Ok(rows) => {
                 if rows.is_empty() {
                     println!("  (empty table)");
                 } else {
-                    println!("  Found {} rows", rows.len());
-                    
-                    // For large tables, only show first 10 rows
-                    let rows_to_show = if rows.len() > 10 {
-                        println!("  (showing first 10 rows)");
-                        &rows[..10]
-                    } else {
-                        &rows[..]
-                    };
-                    
-                    display_table_data(rows_to_show);
-                    
-                    if rows.len() > 10 {
-                        println!("  ... and {} more rows", rows.len() - 10);
-                    }
+                    println!("  Found {} rows (showing first 10)", rows.len());
+                    display_table_data(&rows);
                 }
             }
             Err(e) => {
-                println!("  Error reading table: {}", e);
+                println!("  Error querying table: {} (table may not have suitable indexes)", e);
             }
         }
     }
