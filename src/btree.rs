@@ -44,6 +44,8 @@ pub struct BTreeCursor {
     visited_pages: Vec<u32>,
     /// Safety counter to prevent infinite loops
     iteration_count: usize,
+    /// Reusable cell buffer to reduce allocations
+    cell_buffer: Vec<u8>,
 }
 
 impl BTreeCursor {
@@ -54,6 +56,7 @@ impl BTreeCursor {
             page_stack: vec![(root_page, 0, false)],
             visited_pages: vec![page_number],
             iteration_count: 0,
+            cell_buffer: Vec::with_capacity(1024), // Pre-allocate buffer for cell data
         }
     }
     

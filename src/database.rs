@@ -1,19 +1,22 @@
 //! Main database interface
 
-use crate::{
-    Error, Result, Value,
-    format::{FileHeader, SQLITE_HEADER_MAGIC},
-    page::Page,
-    btree::BTreeCursor,
-    record::parse_record,
-    logging::{log_error, log_warn, log_debug},
-    query::{ComparisonOperator, Expr, SelectQuery},
-};
-use byteorder::{BigEndian, ByteOrder};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::collections::HashMap;
+use memmap2::Mmap;
+use byteorder::{BigEndian, ByteOrder};
+
+use crate::{
+    btree::{BTreeCursor, Cell},
+    error::{Error, Result},
+    format::{FileHeader, SQLITE_HEADER_MAGIC},
+    logging::{log_debug, log_error, log_warn},
+    page::Page,
+    query::{ComparisonOperator, Expr, SelectQuery},
+    record::parse_record,
+    value::Value,
+};
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 use alloc::{vec::Vec, string::String, format};
@@ -24,6 +27,7 @@ pub type Row = HashMap<String, Value>;
 /// SQLite database reader
 pub struct Database {
     file: File,
+    mmap: Mmap,
     header: FileHeader,
     /// Cache of table schemas and their indexes
     schema_cache: HashMap<String, TableInfo>,
@@ -34,11 +38,13 @@ pub struct Database {
     max_cache_size: usize,
     /// LRU ordering for page cache - tracks access order
     page_lru_order: Vec<u32>,
+    /// Interned column names to avoid string allocation during row creation
+    column_name_cache: HashMap<String, String>,
 }
 
 impl Database {
-    /// Open a SQLite database file for reading
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    /// Open a SQLite database file
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
         let mut file = File::open(path)?;
         
         // Read and validate header
@@ -52,16 +58,21 @@ impl Database {
         
         let header = Self::parse_header(&header_bytes)?;
         
+        // Create memory-mapped file for faster access
+        let mmap = unsafe { Mmap::map(&file)? };
+        
         let mut db = Database { 
             file, 
+            mmap,
             header,
             schema_cache: HashMap::new(),
             page_cache: HashMap::new(),
-            max_cache_size: 1000, // Increased cache size for better performance
+            max_cache_size: 5000, // Increased cache size significantly for table scans
             page_lru_order: Vec::new(),
+            column_name_cache: HashMap::new(),
         };
         
-        // Preload schema information
+        // Load schema information
         db.load_schema()?;
         
         Ok(db)
@@ -226,7 +237,7 @@ impl Database {
         })
     }
     
-    /// Read a page by number (1-indexed) with caching
+    /// Read a page with optimized caching for sequential access patterns
     fn read_page(&mut self, page_number: u32) -> Result<Page> {
         if page_number == 0 || page_number > self.header.database_size {
             return Err(Error::InvalidPage(page_number));
@@ -240,15 +251,18 @@ impl Database {
             return Ok(page.clone());
         }
         
-        // Read from disk
-        let offset = (page_number - 1) as u64 * self.header.page_size as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
+        // Read from memory-mapped file (much faster than file I/O)
+        let offset = (page_number - 1) as usize * self.header.page_size as usize;
+        let page_size = self.header.page_size as usize;
         
-        let mut data = vec![0u8; self.header.page_size as usize];
-        self.file.read_exact(&mut data)?;
+        if offset + page_size > self.mmap.len() {
+            return Err(Error::InvalidPage(page_number));
+        }
         
+        let data = self.mmap[offset..offset + page_size].to_vec();
         let page = Page::parse(page_number, data, page_number == 1)?;
         
+        // For table scans, implement a more aggressive caching strategy
         // Cache the page with proper LRU eviction
         if self.page_cache.len() >= self.max_cache_size {
             // Remove the least recently used page
@@ -263,6 +277,55 @@ impl Database {
         self.page_lru_order.push(page_number);
         
         Ok(page)
+    }
+    
+    /// Read multiple pages in a batch for better I/O efficiency
+    fn read_pages_batch(&mut self, page_numbers: &[u32]) -> Result<Vec<Page>> {
+        let mut pages = Vec::with_capacity(page_numbers.len());
+        let mut uncached_pages = Vec::new();
+        
+        // First, check cache for all pages
+        for &page_number in page_numbers {
+            if let Some(page) = self.page_cache.get(&page_number) {
+                pages.push(page.clone());
+                // Update LRU order
+                self.page_lru_order.retain(|&x| x != page_number);
+                self.page_lru_order.push(page_number);
+            } else {
+                uncached_pages.push(page_number);
+            }
+        }
+        
+        // Read uncached pages from memory-mapped file
+        for page_number in uncached_pages {
+            if page_number == 0 || page_number > self.header.database_size {
+                return Err(Error::InvalidPage(page_number));
+            }
+            
+            let offset = (page_number - 1) as usize * self.header.page_size as usize;
+            let page_size = self.header.page_size as usize;
+            
+            if offset + page_size > self.mmap.len() {
+                return Err(Error::InvalidPage(page_number));
+            }
+            
+            let data = self.mmap[offset..offset + page_size].to_vec();
+            let page = Page::parse(page_number, data, page_number == 1)?;
+            pages.push(page.clone());
+            
+            // Cache the page
+            if self.page_cache.len() >= self.max_cache_size {
+                if let Some(&oldest_page) = self.page_lru_order.first() {
+                    self.page_cache.remove(&oldest_page);
+                    self.page_lru_order.retain(|&x| x != oldest_page);
+                }
+            }
+            
+            self.page_cache.insert(page_number, page);
+            self.page_lru_order.push(page_number);
+        }
+        
+        Ok(pages)
     }
     
     /// List all tables in the database
@@ -424,9 +487,20 @@ impl Database {
         Ok(table_info.columns.clone())
     }
 
-    /// Perform a full table scan to read all rows
-    fn read_all_table_rows(&mut self, table_name: &str) -> Result<Vec<Row>> {
-        log_debug(&format!("Performing full table scan for table: {}", table_name));
+    /// Get interned column name to avoid string allocations
+    fn intern_column_name(&mut self, name: &str) -> &str {
+        if !self.column_name_cache.contains_key(name) {
+            self.column_name_cache.insert(name.to_string(), name.to_string());
+        }
+        self.column_name_cache.get(name).unwrap()
+    }
+
+    /// Perform a streaming table scan that processes rows one at a time for better memory efficiency
+    fn read_table_rows_streaming<F>(&mut self, table_name: &str, limit: Option<usize>, mut row_processor: F) -> Result<usize>
+    where
+        F: FnMut(&Row) -> bool, // Return false to stop processing
+    {
+        log_debug(&format!("Performing streaming table scan for table: {}", table_name));
         
         // Get table info from cache
         let table_info = self.schema_cache.get(table_name)
@@ -434,20 +508,32 @@ impl Database {
         
         let columns = table_info.columns.clone();
         
+        // Pre-intern all column names to avoid allocations during row creation
+        for col in &columns {
+            if !self.column_name_cache.contains_key(col) {
+                self.column_name_cache.insert(col.clone(), col.clone());
+            }
+        }
+        
         // Detect INTEGER PRIMARY KEY column by parsing the SQL
         let rowid_column = self.find_rowid_column(table_name)?;
         
         let root_page = self.read_page(table_info.root_page)?;
         let mut cursor = BTreeCursor::new(root_page);
-        let mut rows = Vec::new();
         
         // Safety check: limit number of rows to prevent excessive memory usage
-        let max_rows = 1_000_000;
+        let max_rows = limit.unwrap_or(1_000_000);
         let mut row_count = 0;
+        let mut processed_count = 0;
+        
+        // Reuse row object to reduce allocations
+        let mut row = HashMap::with_capacity(columns.len());
         
         while let Some(cell) = cursor.next_cell(|page_num| self.read_page(page_num))? {
             if row_count >= max_rows {
-                log_warn(&format!("Table scan truncated at {} rows (limit: {})", row_count, max_rows));
+                if limit.is_none() {
+                    log_warn(&format!("Table scan truncated at {} rows (limit: {})", row_count, max_rows));
+                }
                 break;
             }
             
@@ -459,8 +545,10 @@ impl Database {
             // Parse the row data
             match parse_record(&cell.payload) {
                 Ok(values) => {
+                    // Clear and reuse the row HashMap
+                    row.clear();
+                    
                     // Convert to a row with column names
-                    let mut row = HashMap::new();
                     for (i, column_name) in columns.iter().enumerate() {
                         if let Some(ref rowid_col) = rowid_column {
                             if column_name == rowid_col {
@@ -473,7 +561,13 @@ impl Database {
                         let value = values.get(i).cloned().unwrap_or(Value::Null);
                         row.insert(column_name.clone(), value);
                     }
-                    rows.push(row);
+                    
+                    // Process the row
+                    if !row_processor(&row) {
+                        break; // Stop processing if processor returns false
+                    }
+                    
+                    processed_count += 1;
                     row_count += 1;
                 },
                 Err(e) => {
@@ -484,8 +578,138 @@ impl Database {
             }
         }
         
-        log_debug(&format!("Table scan completed: {} rows read from {}", rows.len(), table_name));
+        log_debug(&format!("Streaming table scan completed: {} rows processed from {}", processed_count, table_name));
+        Ok(processed_count)
+    }
+
+    /// Perform a full table scan with batch processing for better performance
+    fn read_all_table_rows_batch(&mut self, table_name: &str, limit: Option<usize>) -> Result<Vec<Row>> {
+        // For small limits, use streaming to reduce memory usage
+        if let Some(limit_val) = limit {
+            if limit_val <= 10000 {
+                let mut rows = Vec::with_capacity(limit_val);
+                let mut count = 0;
+                
+                self.read_table_rows_streaming(table_name, limit, |row| {
+                    if count < limit_val {
+                        rows.push(row.clone());
+                        count += 1;
+                        true
+                    } else {
+                        false
+                    }
+                })?;
+                
+                return Ok(rows);
+            }
+        }
+        
+        // Fall back to original batch processing for larger datasets
+        log_debug(&format!("Performing batch table scan for table: {}", table_name));
+        
+        // Get table info from cache
+        let table_info = self.schema_cache.get(table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        
+        let columns = table_info.columns.clone();
+        
+        // Pre-intern all column names to avoid allocations during row creation
+        for col in &columns {
+            if !self.column_name_cache.contains_key(col) {
+                self.column_name_cache.insert(col.clone(), col.clone());
+            }
+        }
+        
+        // Detect INTEGER PRIMARY KEY column by parsing the SQL
+        let rowid_column = self.find_rowid_column(table_name)?;
+        
+        let root_page = self.read_page(table_info.root_page)?;
+        let mut cursor = BTreeCursor::new(root_page);
+        
+        // Pre-allocate with estimated capacity to reduce reallocations
+        let estimated_rows = limit.unwrap_or(10000).min(100000);
+        let mut rows = Vec::with_capacity(estimated_rows);
+        
+        // Batch processing parameters
+        const BATCH_SIZE: usize = 1000;
+        let mut batch_rows = Vec::with_capacity(BATCH_SIZE);
+        
+        // Safety check: limit number of rows to prevent excessive memory usage
+        let max_rows = limit.unwrap_or(1_000_000);
+        let mut row_count = 0;
+        
+        while let Some(cell) = cursor.next_cell(|page_num| self.read_page(page_num))? {
+            if row_count >= max_rows {
+                if limit.is_none() {
+                    log_warn(&format!("Table scan truncated at {} rows (limit: {})", row_count, max_rows));
+                }
+                break;
+            }
+            
+            // Skip empty payloads (deleted rows)
+            if cell.payload.is_empty() {
+                continue;
+            }
+            
+            // Parse the row data
+            match parse_record(&cell.payload) {
+                Ok(values) => {
+                    // Convert to a row with column names using pre-allocated capacity
+                    let mut row = HashMap::with_capacity(columns.len());
+                    for (i, column_name) in columns.iter().enumerate() {
+                        if let Some(ref rowid_col) = rowid_column {
+                            if column_name == rowid_col {
+                                // This is the INTEGER PRIMARY KEY column - use rowid from cell
+                                row.insert(column_name.clone(), Value::Integer(cell.key));
+                                continue;
+                            }
+                        }
+                        
+                        let value = values.get(i).cloned().unwrap_or(Value::Null);
+                        row.insert(column_name.clone(), value);
+                    }
+                    batch_rows.push(row);
+                    row_count += 1;
+                    
+                    // Process batch when full
+                    if batch_rows.len() >= BATCH_SIZE {
+                        rows.extend(batch_rows.drain(..));
+                        
+                        // Early termination check for LIMIT queries
+                        if let Some(limit_val) = limit {
+                            if rows.len() >= limit_val {
+                                break;
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    log_warn(&format!("Failed to parse row {}: {}", row_count, e));
+                    // Continue with next row instead of failing
+                    continue;
+                }
+            }
+        }
+        
+        // Process remaining rows in batch
+        if !batch_rows.is_empty() {
+            rows.extend(batch_rows);
+        }
+        
+        log_debug(&format!("Batch table scan completed: {} rows read from {}", rows.len(), table_name));
         Ok(rows)
+    }
+
+    /// Perform a full table scan to read all rows with optimized memory management
+    fn read_all_table_rows_optimized(&mut self, table_name: &str, limit: Option<usize>) -> Result<Vec<Row>> {
+        // Use batch processing for better performance
+        self.read_all_table_rows_batch(table_name, limit)
+    }
+
+    /// Perform a full table scan to read all rows
+    fn read_all_table_rows(&mut self, table_name: &str) -> Result<Vec<Row>> {
+        // Use the optimized version with no limit
+        self.read_all_table_rows_optimized(table_name, None)
     }
     
     /// Find the INTEGER PRIMARY KEY column name for a table (if any)
@@ -499,10 +723,10 @@ impl Database {
         
         // Simple pattern matching for INTEGER PRIMARY KEY
         // This is a simplified approach - in a full implementation, we'd use a proper SQL parser
+        // This is a basic implementation that handles common cases
         let sql_lower = sql.to_lowercase();
         
         // Look for patterns like "columnname integer primary key"
-        // This is a basic implementation that handles common cases
         for line in sql_lower.lines() {
             let line = line.trim();
             if line.contains("integer") && line.contains("primary") && line.contains("key") {
@@ -534,19 +758,26 @@ impl Database {
         if let Some(where_expr) = &query.where_expr {
             if let Some(index_rows) = self.try_index_lookup(query, where_expr, &table_info_clone)? {
                 log_debug(&format!("Using index acceleration for query on table {}", table_name));
-                // Index lookup succeeded - apply remaining query operations
-                let mut result_query = query.clone();
-                result_query.where_expr = None; // Remove WHERE clause since index already filtered
-                return result_query.execute(index_rows, &table_info_clone.columns);
+                // Index lookup succeeded - apply remaining operations
+                return self.apply_query_operations(index_rows, query);
             }
         }
         
-        // Fallback to full table scan
-        log_debug(&format!("Falling back to table scan for query on table {}", table_name));
-        let rows = self.read_all_table_rows(table_name)?;
+        // Fall back to table scan
+        log_debug(&format!("Using table scan fallback for query on table {}", table_name));
         
-        // Apply all query operations (WHERE, ORDER BY, column selection, LIMIT)
-        query.execute(rows, &table_info_clone.columns)
+        // Use fast path for simple queries without WHERE clauses
+        let rows = if query.where_expr.is_none() && query.order_by.is_none() {
+            // Fast path for simple SELECT * queries
+            log_debug("Using fast table scan path");
+            self.read_table_rows_fast(table_name, query.limit)?
+        } else {
+            // Use optimized table scan for complex queries
+            self.read_all_table_rows_optimized(table_name, query.limit)?
+        };
+        
+        // Apply query operations (WHERE, ORDER BY, LIMIT)
+        self.apply_query_operations(rows, query)
     }
     
     /// Try to use index lookup for the query, returning Some(rows) if successful, None if no suitable index
@@ -645,6 +876,142 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Fast table scan for simple queries without WHERE clauses
+    fn read_table_rows_fast(&mut self, table_name: &str, limit: Option<usize>) -> Result<Vec<Row>> {
+        log_debug(&format!("Performing fast table scan for table: {}", table_name));
+        
+        // Use the high-performance optimized version
+        self.read_table_rows_optimized_v2(table_name, limit)
+    }
+
+    /// Apply query operations (WHERE, ORDER BY, LIMIT) to a set of rows
+    fn apply_query_operations(&self, mut rows: Vec<Row>, query: &SelectQuery) -> Result<Vec<Row>> {
+        // Apply WHERE clause
+        if let Some(where_expr) = &query.where_expr {
+            rows.retain(|row| {
+                // Use the query's evaluate_expr method
+                query.evaluate_expr(row, where_expr)
+            });
+        }
+        
+        // Apply ORDER BY
+        if let Some(order_by) = &query.order_by {
+            rows.sort_by(|a, b| {
+                let val_a = a.get(&order_by.column).unwrap_or(&Value::Null);
+                let val_b = b.get(&order_by.column).unwrap_or(&Value::Null);
+                
+                let cmp = match (val_a, val_b) {
+                    (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+                    (Value::Real(a), Value::Real(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+                    (Value::Text(a), Value::Text(b)) => a.cmp(b),
+                    (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                    (Value::Null, _) => std::cmp::Ordering::Less,
+                    (_, Value::Null) => std::cmp::Ordering::Greater,
+                    _ => std::cmp::Ordering::Equal,
+                };
+                
+                if order_by.ascending { cmp } else { cmp.reverse() }
+            });
+        }
+        
+        // Apply LIMIT
+        if let Some(limit) = query.limit {
+            rows.truncate(limit);
+        }
+        
+        // Apply column selection
+        if let Some(ref columns) = query.columns {
+            if !columns.is_empty() && columns != &vec!["*"] {
+                for row in &mut rows {
+                    row.retain(|col_name, _| columns.contains(col_name));
+                }
+            }
+        }
+        
+        Ok(rows)
+    }
+
+    /// High-performance table scan that minimizes allocations
+    fn read_table_rows_optimized_v2(&mut self, table_name: &str, limit: Option<usize>) -> Result<Vec<Row>> {
+        log_debug(&format!("Performing high-performance table scan for table: {}", table_name));
+        
+        // Get table info from cache
+        let table_info = self.schema_cache.get(table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        
+        let columns = table_info.columns.clone();
+        let root_page_num = table_info.root_page;
+        
+        // Pre-allocate with estimated capacity
+        let estimated_rows = limit.unwrap_or(100_000).min(100_000);
+        let mut rows = Vec::with_capacity(estimated_rows);
+        
+        // Pre-intern column names once
+        let interned_columns: Vec<String> = columns.iter().map(|col| {
+            if !self.column_name_cache.contains_key(col) {
+                self.column_name_cache.insert(col.clone(), col.clone());
+            }
+            col.clone()
+        }).collect();
+        
+        // Read root page
+        let root_page = self.read_page(root_page_num)?;
+        let mut cursor = BTreeCursor::new(root_page);
+        let mut count = 0;
+        
+        // Safety limits
+        const MAX_ROWS: usize = 1_000_000;
+        const MAX_ITERATIONS: usize = 10_000_000;
+        
+        let row_limit = limit.unwrap_or(MAX_ROWS).min(MAX_ROWS);
+        
+        // Pre-allocate reusable row HashMap
+        let mut reusable_row = HashMap::with_capacity(columns.len());
+        
+        for iteration in 0..MAX_ITERATIONS {
+            if count >= row_limit {
+                log_debug(&format!("Reached row limit: {}", row_limit));
+                break;
+            }
+            
+            match cursor.next_cell(|page_num| self.read_page(page_num)) {
+                Ok(Some(cell)) => {
+                    // Parse record with minimal allocations using optimized parser
+                    if let Ok(values) = crate::record::parse_record_optimized(&cell.payload) {
+                        if values.len() <= columns.len() {
+                            reusable_row.clear();
+                            
+                            // Fill row with minimal string allocations
+                            for (i, col_name) in interned_columns.iter().enumerate() {
+                                let value = if i < values.len() {
+                                    values[i].clone()
+                                } else {
+                                    Value::Null
+                                };
+                                reusable_row.insert(col_name.clone(), value);
+                            }
+                            
+                            // Clone the completed row
+                            rows.push(reusable_row.clone());
+                            count += 1;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log_debug("High-performance table scan completed - no more cells");
+                    break;
+                }
+                Err(e) => {
+                    log_warn(&format!("Error reading cell in high-perf scan (iteration {}): {}", iteration, e));
+                    break;
+                }
+            }
+        }
+        
+        log_debug(&format!("High-performance table scan completed: {} rows processed", count));
+        Ok(rows)
     }
 } // end impl Database
 
