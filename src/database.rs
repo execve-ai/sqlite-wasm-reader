@@ -32,6 +32,8 @@ pub struct Database {
     page_cache: HashMap<u32, Page>,
     /// Maximum number of pages to cache (LRU eviction)
     max_cache_size: usize,
+    /// LRU ordering for page cache - tracks access order
+    page_lru_order: Vec<u32>,
 }
 
 impl Database {
@@ -55,7 +57,8 @@ impl Database {
             header,
             schema_cache: HashMap::new(),
             page_cache: HashMap::new(),
-            max_cache_size: 100, // Cache up to 100 pages
+            max_cache_size: 1000, // Increased cache size for better performance
+            page_lru_order: Vec::new(),
         };
         
         // Preload schema information
@@ -230,6 +233,9 @@ impl Database {
         
         // Check cache first
         if let Some(page) = self.page_cache.get(&page_number) {
+            // Update LRU order - move to end (most recently used)
+            self.page_lru_order.retain(|&x| x != page_number);
+            self.page_lru_order.push(page_number);
             return Ok(page.clone());
         }
         
@@ -242,23 +248,18 @@ impl Database {
         
         let page = Page::parse(page_number, data, page_number == 1)?;
         
-        // Cache the page (with size limit to prevent excessive memory usage)
-        const MAX_CACHED_PAGES: usize = 100; // Limit cache to ~100 pages
-        if self.page_cache.len() >= MAX_CACHED_PAGES {
-            // Simple eviction: remove a random page
-            if let Some(&key_to_remove) = self.page_cache.keys().next() {
-                self.page_cache.remove(&key_to_remove);
+        // Cache the page with proper LRU eviction
+        if self.page_cache.len() >= self.max_cache_size {
+            // Remove the least recently used page
+            if let Some(&oldest_page) = self.page_lru_order.first() {
+                self.page_cache.remove(&oldest_page);
+                self.page_lru_order.retain(|&x| x != oldest_page);
             }
         }
         
-        // Cache the page with LRU eviction
-        if self.page_cache.len() >= self.max_cache_size {
-            // Remove the oldest entry (simple approach: remove first key)
-            if let Some(&oldest_key) = self.page_cache.keys().next() {
-                self.page_cache.remove(&oldest_key);
-            }
-        }
+        // Insert the new page and update LRU order
         self.page_cache.insert(page_number, page.clone());
+        self.page_lru_order.push(page_number);
         
         Ok(page)
     }
@@ -473,9 +474,9 @@ impl Database {
         let all_rowids: Vec<_> = all_rowids.into_iter().collect();
         let mut rows = Vec::with_capacity(all_rowids.len());
         
-        // Fetch each matching row by its ROWID
+        // Fetch each matching row by its ROWID using targeted lookups
         for rowid in all_rowids {
-            if let Some(row) = read_row_by_rowid(self, table_name, rowid, &columns)? {
+            if let Some(row) = self.read_row_by_rowid(table_name, rowid, &columns)? {
                 rows.push(row);
             }
         }
@@ -489,7 +490,44 @@ impl Database {
         Ok(result)
     }
     
+    /// Read a single row by its ROWID using targeted binary search
+    fn read_row_by_rowid(&mut self, table_name: &str, rowid: i64, columns: &[String]) -> Result<Option<Row>> {
+        // Get the table's root page from cache
+        let table_info = self.schema_cache.get(table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        
+        let root_page = self.read_page(table_info.root_page)?;
+        let mut cursor = BTreeCursor::new(root_page);
 
+        // Try to find the cell with the matching ROWID using binary search
+        match cursor.find_cell(rowid, |page_num| self.read_page(page_num)) {
+            Ok(Some(cell)) => {
+                // Parse the row data
+                match parse_record(&cell.payload) {
+                    Ok(values) => {
+                        // Convert to a row with column names
+                        let mut row = HashMap::new();
+                        for (i, column_name) in columns.iter().enumerate() {
+                            let value = values.get(i).cloned().unwrap_or(Value::Null);
+                            row.insert(column_name.clone(), value);
+                        }
+                        
+                        Ok(Some(row))
+                    },
+                    Err(_) => {
+                        // Return None instead of failing to allow processing to continue with other rows
+                        Ok(None)
+                    }
+                }
+            },
+            Ok(None) => {
+                Ok(None)
+            },
+            Err(e) => {
+                Err(e)
+            }
+        }
+    }
 } // end impl Database
 
 /// Collect all branches of an OR expression.
@@ -587,44 +625,7 @@ fn collect_and_conditions<'b>(expr: &'b Expr, conditions: &mut HashMap<String, &
     }
 }
 
-/// Read a single row by its ROWID
-fn read_row_by_rowid(db: &mut Database, table_name: &str, rowid: i64, columns: &[String]) -> Result<Option<Row>> {
-    // Get the table's root page from cache
-    let table_info = db.schema_cache.get(table_name)
-        .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
-    
-    let root_page = db.read_page(table_info.root_page)?;
-    let mut cursor = BTreeCursor::new(root_page);
 
-    // Try to find the cell with the matching ROWID
-    match cursor.find_cell(rowid, |page_num| db.read_page(page_num)) {
-        Ok(Some(cell)) => {
-            // Parse the row data
-            match parse_record(&cell.payload) {
-                Ok(values) => {
-                    // Convert to a row with column names
-                    let mut row = HashMap::new();
-                    for (i, column_name) in columns.iter().enumerate() {
-                        let value = values.get(i).cloned().unwrap_or(Value::Null);
-                        row.insert(column_name.clone(), value);
-                    }
-                    
-                    Ok(Some(row))
-                },
-                Err(_) => {
-                    // Return None instead of failing to allow processing to continue with other rows
-                    Ok(None)
-                }
-            }
-        },
-        Ok(None) => {
-            Ok(None)
-        },
-        Err(e) => {
-            Err(e)
-        }
-    }
-}
 
 /// Schema object information
 #[derive(Debug, Clone)]

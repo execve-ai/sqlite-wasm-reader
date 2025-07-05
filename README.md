@@ -195,38 +195,65 @@ let rows = db.execute_query(&query)?;
 let count = db.count_table_rows("table_name")?;
 ```
 
-### SQL Query Support
+### Query Builder Helpers
 
-The library supports comprehensive SQL SELECT queries with WHERE clauses:
+For programmatic construction of `SELECT` queries without writing raw SQL, use the fluent helper API:
 
 ```rust
-// Execute SQL queries
-let rows = db.execute_sql("SELECT * FROM users WHERE age > 18")?;
+use sqlite_wasm_reader::{query::{SelectQuery, Expr}, Value};
 
-// Complex WHERE clauses with logical operators
-let rows = db.execute_sql("SELECT * FROM users WHERE age > 18 AND status = 'active'")?;
+let query = SelectQuery::new("users")
+    .select_columns(vec!["id".into(), "name".into()])
+    .with_where(
+        Expr::eq("status", Value::Text("active".into()))
+            .and(Expr::gt("age", Value::Integer(18)))
+    )
+    .with_order_by("name", true)
+    .with_limit(100);
 
-// OR conditions
-let rows = db.execute_sql("SELECT * FROM users WHERE age = 25 OR age = 30")?;
-
-// IN clauses
-let rows = db.execute_sql("SELECT * FROM users WHERE age IN (25, 30, 35)")?;
-
-// BETWEEN ranges
-let rows = db.execute_sql("SELECT * FROM users WHERE age BETWEEN 20 AND 30")?;
-
-// NULL checks
-let rows = db.execute_sql("SELECT * FROM users WHERE email IS NOT NULL")?;
-
-// Complex expressions with parentheses
-let rows = db.execute_sql("SELECT * FROM users WHERE (age > 18 OR age < 65) AND status = 'active'")?;
-
-// LIKE patterns
-let rows = db.execute_sql("SELECT * FROM users WHERE name LIKE 'John%'")?;
-
-// ORDER BY and LIMIT
-let rows = db.execute_sql("SELECT * FROM users ORDER BY age DESC LIMIT 10")?;
+let rows = db.execute_query(&query)?;
 ```
+
+### SQL Query Support
+
+`sqlite_wasm_reader` lets you query data either by parsing raw SQL _or_ by constructing `SelectQuery` objects directly and executing them with `Database::execute_query()`.
+
+```rust
+use sqlite_wasm_reader::{Database, Error};
+use sqlite_wasm_reader::query::{SelectQuery, Expr};
+use sqlite_wasm_reader::value::Value;
+
+fn complex_report(db: &mut Database) -> Result<(), Error> {
+    // Option 1. Parse raw SQL, then execute
+    let raw = "SELECT * FROM users WHERE age > 18 AND status = 'active' ORDER BY name LIMIT 10";
+    let parsed = SelectQuery::parse(raw)?;
+    let rows = db.execute_query(&parsed)?;
+    println!("{} rows (raw SQL): {}", rows.len(), raw);
+
+    // Option 2. Build programmatically using helpers
+    let builder = SelectQuery::new("users")
+        .select_columns(vec!["id".into(), "name".into(), "age".into()])
+        .with_where(
+            Expr::gt("age", Value::Integer(18))
+                .and(Expr::eq("status", Value::Text("active".into())))
+        )
+        .with_order_by("name", true)
+        .with_limit(10);
+
+    let rows = db.execute_query(&builder)?;
+    println!("{} rows (builder API)", rows.len());
+
+    Ok(())
+}
+```
+
+Both paths end in a call to `execute_query`, which accepts any `SelectQuery` (parsed or manually constructed). This method performs:
+
+* WHERE filtering with logical operators (`AND`, `OR`, `NOT`), `LIKE`, `IN`, `BETWEEN`, `IS NULL` / `IS NOT NULL`.
+* Column projection (`SELECT *` or explicit columns).
+* `ORDER BY` and `LIMIT` processing in memory.
+
+Use whichever style (raw SQL vs builder) best fits your workflow.
 
 ### Value Types
 

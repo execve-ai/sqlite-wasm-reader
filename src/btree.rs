@@ -318,45 +318,51 @@ impl BTreeCursor {
 
         // We're now on a leaf page – gather all rowids whose key matches exactly
         let mut rowids = Vec::new();
-        let mut page_to_scan = Some(current_page);
+        let cell_pointers = current_page.cell_pointers(current_page.page_number == 1)?;
+        
+        for &cell_offset in &cell_pointers {
+            let cell_data = current_page.cell_content(cell_offset)?;
+            let cell = parse_leaf_index_cell(&cell_data)?;
 
-        while let Some(page) = page_to_scan {
-            let cell_pointers = page.cell_pointers(page.page_number == 1)?;
-            for &cell_offset in &cell_pointers {
-                let cell_data = page.cell_content(cell_offset)?;
-                let cell = parse_leaf_index_cell(&cell_data)?;
-
-                // Need at least as many components as the search key
-                if cell.key.len() < key.len() {
-                    continue;
-                }
-                // Exact component-wise equality for the prefix length of key
-                let matches = cell
-                    .key
-                    .iter()
-                    .zip(key.iter())
-                    .all(|(a, b)| a == *b);
+            // Need at least as many components as the search key
+            if cell.key.len() < key.len() {
+                continue;
+            }
+            
+            // Exact component-wise equality for the prefix length of key
+            let matches = cell
+                .key
+                .iter()
+                .zip(key.iter())
+                .all(|(a, b)| a == *b);
+            
+            log_debug(&format!(
+                "[BTreeCursor] Checking cell: key={:?} vs search={:?}, matches={}",
+                cell.key, key, matches
+            ));
+            
+            if matches {
+                log_debug(&format!("[BTreeCursor] MATCH FOUND! Adding rowid {}", cell.rowid));
+                rowids.push(cell.rowid);
+            } else {
+                // Check if the first component still matches - if not, we can stop early
+                let first_component_matches = key.first().map(|v| *v) == cell.key.first();
                 
-                log_debug(&format!(
-                    "[BTreeCursor] Checking cell: key={:?} vs search={:?}, matches={}",
-                    cell.key, key, matches
-                ));
-                
-                if matches {
-                    log_debug(&format!("[BTreeCursor] MATCH FOUND! Adding rowid {}", cell.rowid));
-                    rowids.push(cell.rowid);
-                } else if key.first().map(|v| *v) == cell.key.first() {
-                    // Helpful debug when first component matches but full key doesn't
+                if first_component_matches {
                     log_debug(&format!(
                         "[BTreeCursor] Partial composite key mismatch – cell key {:?} vs search {:?}",
                         cell.key, key
                     ));
+                } else {
+                    // First component doesn't match, and since the page is sorted,
+                    // no further cells will match either
+                    log_debug(&format!(
+                        "[BTreeCursor] First component mismatch, stopping early scan on page {}",
+                        current_page.page_number
+                    ));
+                    break;
                 }
             }
-
-            // Optimisation: the next leaf page might still contain the same first-column value.
-            // For now we stop after the first leaf as SQLite indexes are ordered and no further exact matches will appear once first component differs.
-            page_to_scan = None;
         }
 
         log_debug(&format!(

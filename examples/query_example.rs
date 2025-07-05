@@ -1,6 +1,7 @@
 //! Example demonstrating SELECT query functionality
 
 use sqlite_wasm_reader::{Database, Error, Value, init_default_logger, set_log_level, LogLevel, SelectQuery};
+use sqlite_wasm_reader::query::Expr;
 use std::env;
 
 fn main() -> Result<(), Error> {
@@ -34,6 +35,32 @@ fn main() -> Result<(), Error> {
     // Use the first table for examples
     let table_name = &tables[0];
     println!("\nRunning queries on table: {}", table_name);
+
+    // ------------------------------------------------------------------
+    // Example 0: Using the builder-style helper API
+    // ------------------------------------------------------------------
+    println!("\n=== Example 0: Builder-style query helpers ===");
+    // Fetch first column name for demonstration
+    let first_row = db.execute_query(&SelectQuery::new(table_name).with_limit(1))?;
+    if let Some(row) = first_row.first() {
+        if let Some(first_col) = row.keys().next() {
+            let builder_query = SelectQuery::new(table_name)
+                .select_columns(vec![first_col.clone()])
+                .with_where(Expr::is_not_null(first_col.clone()))
+                .with_limit(5);
+
+            println!("Builder query struct: {:?}", builder_query);
+            match db.execute_query(&builder_query) {
+                Ok(rows) => {
+                    println!("Found {} rows using builder:", rows.len());
+                    for (i, row) in rows.iter().enumerate() {
+                        println!("Row {}: {:?}", i + 1, row);
+                    }
+                }
+                Err(e) => println!("Error executing builder query: {}", e),
+            }
+        }
+    }
     
     // Example 1: Simple SELECT *
     println!("\n=== Example 1: SELECT * FROM {} ===", table_name);

@@ -66,6 +66,107 @@ pub struct OrderBy {
     pub ascending: bool,
 }
 
+// -----------------------------------------------------------------------------
+// Helper constructors & combinators for `Expr`
+// -----------------------------------------------------------------------------
+impl Expr {
+    /// Create `column = value` comparison expression
+    pub fn eq(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::Equal,
+            value,
+        }
+    }
+
+    /// Create `column != value` comparison expression
+    pub fn ne(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::NotEqual,
+            value,
+        }
+    }
+
+    /// Create `column < value` comparison expression
+    pub fn lt(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::LessThan,
+            value,
+        }
+    }
+
+    /// Create `column <= value` comparison expression
+    pub fn le(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::LessThanOrEqual,
+            value,
+        }
+    }
+
+    /// Create `column > value` comparison expression
+    pub fn gt(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::GreaterThan,
+            value,
+        }
+    }
+
+    /// Create `column >= value` comparison expression
+    pub fn ge(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::GreaterThanOrEqual,
+            value,
+        }
+    }
+
+    /// Create `column LIKE value` expression
+    pub fn like(column: impl Into<String>, value: Value) -> Self {
+        Expr::Comparison {
+            column: column.into(),
+            operator: ComparisonOperator::Like,
+            value,
+        }
+    }
+
+    /// Create `column IS NULL` expression
+    pub fn is_null(column: impl Into<String>) -> Self {
+        Expr::IsNull(column.into())
+    }
+
+    /// Create `column IS NOT NULL` expression
+    pub fn is_not_null(column: impl Into<String>) -> Self {
+        Expr::IsNotNull(column.into())
+    }
+
+    /// Create `column IN (values...)` expression
+    pub fn in_values(column: impl Into<String>, values: Vec<Value>) -> Self {
+        Expr::In {
+            column: column.into(),
+            values,
+        }
+    }
+
+    /// Logical AND: `self AND other`
+    pub fn and(self, other: Expr) -> Self {
+        Expr::And(Box::new(self), Box::new(other))
+    }
+
+    /// Logical OR: `self OR other`
+    pub fn or(self, other: Expr) -> Self {
+        Expr::Or(Box::new(self), Box::new(other))
+    }
+
+    /// Logical NOT: `NOT self`
+    pub fn not(self) -> Self {
+        Expr::Not(Box::new(self))
+    }
+}
+
 impl SelectQuery {
     /// Parse a SELECT SQL statement using sqlparser
     pub fn parse(sql: &str) -> Result<Self> {
@@ -568,6 +669,48 @@ impl SelectQuery {
                 Ok(result_rows)
             }
         }
+    }
+}
+
+impl SelectQuery {
+    /// Create a new `SelectQuery` for the given `table` with default values (SELECT *)
+    pub fn new(table: impl Into<String>) -> Self {
+        Self {
+            columns: None,
+            table: table.into(),
+            where_expr: None,
+            order_by: None,
+            limit: None,
+        }
+    }
+
+    /// Specify the columns to select (equivalent to the projection in SQL).
+    /// Passing an empty vector is the same as `SELECT *`.
+    pub fn select_columns(mut self, columns: Vec<String>) -> Self {
+        if columns.is_empty() {
+            self.columns = None;
+        } else {
+            self.columns = Some(columns);
+        }
+        self
+    }
+
+    /// Attach a WHERE expression to the query.
+    pub fn with_where(mut self, expr: Expr) -> Self {
+        self.where_expr = Some(expr);
+        self
+    }
+
+    /// Attach an ORDER BY clause to the query.
+    pub fn with_order_by(mut self, column: impl Into<String>, ascending: bool) -> Self {
+        self.order_by = Some(OrderBy { column: column.into(), ascending });
+        self
+    }
+
+    /// Attach a LIMIT clause to the query.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
     }
 }
 
