@@ -45,6 +45,8 @@ pub enum Expr {
     IsNotNull(String),
     /// IN (list of values)
     In { column: String, values: Vec<Value> },
+    /// BETWEEN (range check)
+    Between { column: String, low: Value, high: Value },
 }
 
 /// Comparison operators for WHERE clauses
@@ -148,6 +150,15 @@ impl Expr {
         Expr::In {
             column: column.into(),
             values,
+        }
+    }
+
+    /// Create `column BETWEEN low AND high` expression
+    pub fn between(column: impl Into<String>, low: Value, high: Value) -> Self {
+        Expr::Between {
+            column: column.into(),
+            low,
+            high,
         }
     }
 
@@ -308,6 +319,22 @@ impl SelectQuery {
                     })
                 } else {
                     Err(Error::QueryError("Expected column name before IN".to_string()))
+                }
+            },
+            SqlExpr::Between { expr, negated, low, high } => {
+                if *negated {
+                    return Err(Error::QueryError("NOT BETWEEN is not supported".to_string()));
+                }
+                if let SqlExpr::Identifier(ident) = &**expr {
+                    let low_value = Self::parse_sql_value(low)?;
+                    let high_value = Self::parse_sql_value(high)?;
+                    Ok(Expr::Between {
+                        column: ident.value.clone(),
+                        low: low_value,
+                        high: high_value,
+                    })
+                } else {
+                    Err(Error::QueryError("Expected column name before BETWEEN".to_string()))
                 }
             },
             SqlExpr::Nested(expr) => Self::parse_where_expr(expr),
@@ -513,6 +540,16 @@ impl SelectQuery {
             Expr::In { column, values } => {
                 let row_value = row.get(column.as_str()).cloned().unwrap_or(Value::Null);
                 values.iter().any(|v| self.values_equal(&row_value, v))
+            },
+            Expr::Between { column, low, high } => {
+                let row_value = match row.get(column.as_str()) {
+                    Some(value) => value,
+                    None => return false, // Column doesn't exist
+                };
+                
+                // Check if row_value >= low AND row_value <= high
+                (self.values_equal(row_value, low) || !self.value_less_than(row_value, low)) &&
+                (self.values_equal(row_value, high) || self.value_less_than(row_value, high))
             },
         }
     }
@@ -785,5 +822,81 @@ mod tests {
         // Test exact match (no wildcards)
         assert!(query.value_like(&Value::Text("exact".to_string()), &Value::Text("exact".to_string())));
         assert!(!query.value_like(&Value::Text("different".to_string()), &Value::Text("exact".to_string())));
+    }
+
+    #[test]
+    fn test_parse_select_with_between() {
+        let query = SelectQuery::parse("SELECT * FROM users WHERE age BETWEEN 18 AND 65").unwrap();
+        assert_eq!(query.table, "users");
+        assert!(query.where_expr.is_some());
+        
+        let expr = query.where_expr.as_ref().unwrap();
+        if let Expr::Between { column, low, high } = expr {
+            assert_eq!(column, "age");
+            assert_eq!(low, &Value::Integer(18));
+            assert_eq!(high, &Value::Integer(65));
+        } else {
+            panic!("Expected Between expr, got {:?}", expr);
+        }
+    }
+
+    #[test]
+    fn test_between_evaluation() {
+        let query = SelectQuery::parse("SELECT * FROM users").unwrap();
+        let mut row = std::collections::HashMap::new();
+        
+        // Test integer BETWEEN
+        row.insert("age".to_string(), Value::Integer(25));
+        let expr = Expr::Between {
+            column: "age".to_string(),
+            low: Value::Integer(18),
+            high: Value::Integer(65),
+        };
+        assert!(query.evaluate_expr(&row, &expr));
+        
+        // Test value outside range (too low)
+        row.insert("age".to_string(), Value::Integer(15));
+        assert!(!query.evaluate_expr(&row, &expr));
+        
+        // Test value outside range (too high)
+        row.insert("age".to_string(), Value::Integer(70));
+        assert!(!query.evaluate_expr(&row, &expr));
+        
+        // Test boundary values
+        row.insert("age".to_string(), Value::Integer(18));
+        assert!(query.evaluate_expr(&row, &expr));
+        
+        row.insert("age".to_string(), Value::Integer(65));
+        assert!(query.evaluate_expr(&row, &expr));
+        
+        // Test float BETWEEN
+        row.insert("score".to_string(), Value::Real(85.5));
+        let expr = Expr::Between {
+            column: "score".to_string(),
+            low: Value::Real(80.0),
+            high: Value::Real(90.0),
+        };
+        assert!(query.evaluate_expr(&row, &expr));
+        
+        // Test mixed types (integer value, real bounds)
+        row.insert("score".to_string(), Value::Integer(85));
+        assert!(query.evaluate_expr(&row, &expr));
+    }
+
+    #[test]
+    fn test_between_builder_api() {
+        let query = SelectQuery::new("users")
+            .with_where(Expr::between("age", Value::Integer(18), Value::Integer(65)));
+        
+        assert_eq!(query.table, "users");
+        assert!(query.where_expr.is_some());
+        
+        if let Some(Expr::Between { column, low, high }) = &query.where_expr {
+            assert_eq!(column, "age");
+            assert_eq!(low, &Value::Integer(18));
+            assert_eq!(high, &Value::Integer(65));
+        } else {
+            panic!("Expected Between expr");
+        }
     }
 }

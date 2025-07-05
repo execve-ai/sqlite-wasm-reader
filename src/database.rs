@@ -89,6 +89,7 @@ impl Database {
                     root_page: object.root_page,
                     columns,
                     indexes: Vec::new(),
+                    sql: object.sql.clone(),
                 };
                 tables.insert(name.clone(), table_info);
             }
@@ -295,8 +296,7 @@ impl Database {
             }
         };
         
-        // Use the same B-tree traversal logic as read_table_limited
-        // but only count cells, don't parse them
+        // Only count cells, don't parse them
         let mut cursor = BTreeCursor::new(root_page);
         let mut row_count = 0;
         
@@ -423,8 +423,104 @@ impl Database {
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
         Ok(table_info.columns.clone())
     }
+
+    /// Perform a full table scan to read all rows
+    fn read_all_table_rows(&mut self, table_name: &str) -> Result<Vec<Row>> {
+        log_debug(&format!("Performing full table scan for table: {}", table_name));
+        
+        // Get table info from cache
+        let table_info = self.schema_cache.get(table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        
+        let columns = table_info.columns.clone();
+        
+        // Detect INTEGER PRIMARY KEY column by parsing the SQL
+        let rowid_column = self.find_rowid_column(table_name)?;
+        
+        let root_page = self.read_page(table_info.root_page)?;
+        let mut cursor = BTreeCursor::new(root_page);
+        let mut rows = Vec::new();
+        
+        // Safety check: limit number of rows to prevent excessive memory usage
+        let max_rows = 1_000_000;
+        let mut row_count = 0;
+        
+        while let Some(cell) = cursor.next_cell(|page_num| self.read_page(page_num))? {
+            if row_count >= max_rows {
+                log_warn(&format!("Table scan truncated at {} rows (limit: {})", row_count, max_rows));
+                break;
+            }
+            
+            // Skip empty payloads (deleted rows)
+            if cell.payload.is_empty() {
+                continue;
+            }
+            
+            // Parse the row data
+            match parse_record(&cell.payload) {
+                Ok(values) => {
+                    // Convert to a row with column names
+                    let mut row = HashMap::new();
+                    for (i, column_name) in columns.iter().enumerate() {
+                        if let Some(ref rowid_col) = rowid_column {
+                            if column_name == rowid_col {
+                                // This is the INTEGER PRIMARY KEY column - use rowid from cell
+                                row.insert(column_name.clone(), Value::Integer(cell.key));
+                                continue;
+                            }
+                        }
+                        
+                        let value = values.get(i).cloned().unwrap_or(Value::Null);
+                        row.insert(column_name.clone(), value);
+                    }
+                    rows.push(row);
+                    row_count += 1;
+                },
+                Err(e) => {
+                    log_warn(&format!("Failed to parse row {}: {}", row_count, e));
+                    // Continue with next row instead of failing
+                    continue;
+                }
+            }
+        }
+        
+        log_debug(&format!("Table scan completed: {} rows read from {}", rows.len(), table_name));
+        Ok(rows)
+    }
     
-    /// Execute a SELECT SQL query using index-based search only
+    /// Find the INTEGER PRIMARY KEY column name for a table (if any)
+    fn find_rowid_column(&self, table_name: &str) -> Result<Option<String>> {
+        // Get the table info from cache
+        let table_info = self.schema_cache.get(table_name)
+            .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        
+        // Parse the CREATE TABLE statement to find INTEGER PRIMARY KEY
+        let sql = &table_info.sql;
+        
+        // Simple pattern matching for INTEGER PRIMARY KEY
+        // This is a simplified approach - in a full implementation, we'd use a proper SQL parser
+        let sql_lower = sql.to_lowercase();
+        
+        // Look for patterns like "columnname integer primary key"
+        // This is a basic implementation that handles common cases
+        for line in sql_lower.lines() {
+            let line = line.trim();
+            if line.contains("integer") && line.contains("primary") && line.contains("key") {
+                // Extract column name - look for the first word before "integer"
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for i in 0..words.len() {
+                    if words[i] == "integer" && i > 0 {
+                        let column_name = words[i-1].trim_matches(',').trim_matches('(').trim_matches('"').trim_matches('`');
+                        return Ok(Some(column_name.to_string()));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// Execute a SELECT SQL query with index acceleration and table scan fallback
     pub fn execute_query(&mut self, query: &SelectQuery) -> Result<Vec<Row>> {
         let table_name = &query.table;
         
@@ -432,22 +528,42 @@ impl Database {
         let table_info = self.schema_cache.get(table_name)
             .ok_or_else(|| Error::TableNotFound(table_name.clone()))?;
         
-        let columns = table_info.columns.clone();
         let table_info_clone = table_info.clone();
-        let has_where = query.where_expr.is_some();
-
-        if !has_where {
-            return Err(Error::QueryError("Query requires a WHERE clause to use index-based search".to_string()));
+        
+        // Try index-based search first if we have a WHERE clause
+        if let Some(where_expr) = &query.where_expr {
+            if let Some(index_rows) = self.try_index_lookup(query, where_expr, &table_info_clone)? {
+                log_debug(&format!("Using index acceleration for query on table {}", table_name));
+                // Index lookup succeeded - apply remaining query operations
+                let mut result_query = query.clone();
+                result_query.where_expr = None; // Remove WHERE clause since index already filtered
+                return result_query.execute(index_rows, &table_info_clone.columns);
+            }
         }
-
-        let where_expr = query.where_expr.as_ref().unwrap();
+        
+        // Fallback to full table scan
+        log_debug(&format!("Falling back to table scan for query on table {}", table_name));
+        let rows = self.read_all_table_rows(table_name)?;
+        
+        // Apply all query operations (WHERE, ORDER BY, column selection, LIMIT)
+        query.execute(rows, &table_info_clone.columns)
+    }
+    
+    /// Try to use index lookup for the query, returning Some(rows) if successful, None if no suitable index
+    fn try_index_lookup(&mut self, query: &SelectQuery, where_expr: &Expr, table_info: &TableInfo) -> Result<Option<Vec<Row>>> {
+        let table_name = &query.table;
+        let columns = &table_info.columns;
         let or_branches = collect_or_branches(where_expr);
         
         // Process each OR branch to find usable indexes
         let mut all_rowids = std::collections::HashSet::new();
+        let mut found_usable_index = false;
         
         for branch in or_branches.iter() {
-            if let Some((index, values)) = find_best_index(&table_info_clone, branch) {
+            if let Some((index, values)) = find_best_index(table_info, branch) {
+                found_usable_index = true;
+                log_debug(&format!("Found usable index '{}' for query condition", index.name));
+                
                 // Process this index branch directly
                 let index_root_page = self.read_page(index.root_page)?;
                 let mut cursor = BTreeCursor::new(index_root_page);
@@ -460,34 +576,25 @@ impl Database {
             }
         }
         
-        // If no branches could use an index, return an error
-        if all_rowids.is_empty() {
-            return Err(Error::QueryError("No suitable index found for the query conditions".to_string()));
+        // If no branches could use an index, return None to trigger table scan
+        if !found_usable_index {
+            log_debug("No suitable index found for query conditions, will use table scan");
+            return Ok(None);
         }
-
-        // If no matching rows are found, return an empty result immediately
-        if all_rowids.is_empty() {
-            return Ok(Vec::new());
-        }
-
+        
         // Convert rowids to a vec for deterministic ordering
         let all_rowids: Vec<_> = all_rowids.into_iter().collect();
         let mut rows = Vec::with_capacity(all_rowids.len());
         
         // Fetch each matching row by its ROWID using targeted lookups
         for rowid in all_rowids {
-            if let Some(row) = self.read_row_by_rowid(table_name, rowid, &columns)? {
+            if let Some(row) = self.read_row_by_rowid(table_name, rowid, columns)? {
                 rows.push(row);
             }
         }
-
-        // When using an index, we trust that the index has already filtered the rows correctly.
-        // We should NOT apply the WHERE clause again, only apply ORDER BY, column selection, and LIMIT.
-        let mut result_query = query.clone();
-        result_query.where_expr = None; // Remove WHERE clause since index already filtered
         
-        let result = result_query.execute(rows, &table_info_clone.columns)?;
-        Ok(result)
+        log_debug(&format!("Index lookup found {} rows", rows.len()));
+        Ok(Some(rows))
     }
     
     /// Read a single row by its ROWID using targeted binary search
@@ -495,6 +602,9 @@ impl Database {
         // Get the table's root page from cache
         let table_info = self.schema_cache.get(table_name)
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
+        
+        // Detect INTEGER PRIMARY KEY column
+        let rowid_column = self.find_rowid_column(table_name)?;
         
         let root_page = self.read_page(table_info.root_page)?;
         let mut cursor = BTreeCursor::new(root_page);
@@ -508,6 +618,14 @@ impl Database {
                         // Convert to a row with column names
                         let mut row = HashMap::new();
                         for (i, column_name) in columns.iter().enumerate() {
+                            if let Some(ref rowid_col) = rowid_column {
+                                if column_name == rowid_col {
+                                    // This is the INTEGER PRIMARY KEY column - use rowid from cell
+                                    row.insert(column_name.clone(), Value::Integer(cell.key));
+                                    continue;
+                                }
+                            }
+                            
                             let value = values.get(i).cloned().unwrap_or(Value::Null);
                             row.insert(column_name.clone(), value);
                         }
@@ -621,6 +739,9 @@ fn collect_and_conditions<'b>(expr: &'b Expr, conditions: &mut HashMap<String, &
         },
         Expr::In { .. } => {
             // Skip IN conditions
+        },
+        Expr::Between { .. } => {
+            // Skip BETWEEN conditions for now (they're not equality conditions)
         }
     }
 }
@@ -644,6 +765,7 @@ pub struct TableInfo {
     pub columns: Vec<String>,
     pub indexes: Vec<IndexInfo>,
     pub root_page: u32,
+    pub sql: String,
 }
 
 /// Index schema information

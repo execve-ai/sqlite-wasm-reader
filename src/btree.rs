@@ -345,22 +345,34 @@ impl BTreeCursor {
                 log_debug(&format!("[BTreeCursor] MATCH FOUND! Adding rowid {}", cell.rowid));
                 rowids.push(cell.rowid);
             } else {
-                // Check if the first component still matches - if not, we can stop early
-                let first_component_matches = key.first().map(|v| *v) == cell.key.first();
-                
-                if first_component_matches {
-                    log_debug(&format!(
-                        "[BTreeCursor] Partial composite key mismatch – cell key {:?} vs search {:?}",
-                        cell.key, key
-                    ));
-                } else {
-                    // First component doesn't match, and since the page is sorted,
-                    // no further cells will match either
-                    log_debug(&format!(
-                        "[BTreeCursor] First component mismatch, stopping early scan on page {}",
-                        current_page.page_number
-                    ));
-                    break;
+                // Check if we've passed the search key alphabetically
+                // Since the page is sorted, if the current cell key is greater than the search key,
+                // no further cells will match
+                if let (Some(search_first), Some(cell_first)) = (key.first(), cell.key.first()) {
+                    match cell_first.cmp(search_first) {
+                        std::cmp::Ordering::Greater => {
+                            // We've passed the search key, stop searching
+                            log_debug(&format!(
+                                "[BTreeCursor] Cell key {:?} > search key {:?}, stopping early scan on page {}",
+                                cell.key, key, current_page.page_number
+                            ));
+                            break;
+                        },
+                        std::cmp::Ordering::Less => {
+                            // Cell key is less than search key, continue searching
+                            log_debug(&format!(
+                                "[BTreeCursor] Cell key {:?} < search key {:?}, continuing search",
+                                cell.key, key
+                            ));
+                        },
+                        std::cmp::Ordering::Equal => {
+                            // First component matches but full key doesn't - could be composite key mismatch
+                            log_debug(&format!(
+                                "[BTreeCursor] Partial composite key mismatch – cell key {:?} vs search {:?}",
+                                cell.key, key
+                            ));
+                        }
+                    }
                 }
             }
         }
