@@ -1,6 +1,6 @@
 //! Example demonstrating SELECT query functionality
 
-use sqlite_wasm_reader::{Database, Error, Value, init_default_logger, set_log_level, LogLevel};
+use sqlite_wasm_reader::{Database, Error, Value, init_default_logger, set_log_level, LogLevel, SelectQuery};
 use std::env;
 
 fn main() -> Result<(), Error> {
@@ -37,7 +37,7 @@ fn main() -> Result<(), Error> {
     
     // Example 1: Simple SELECT *
     println!("\n=== Example 1: SELECT * FROM {} ===", table_name);
-    match db.execute_sql(&format!("SELECT * FROM {}", table_name)) {
+    match SelectQuery::parse(&format!("SELECT * FROM {}", table_name)).and_then(|q| db.execute_query(&q)) {
         Ok(rows) => {
             println!("Found {} rows:", rows.len());
             for (i, row) in rows.iter().take(3).enumerate() {
@@ -62,7 +62,7 @@ fn main() -> Result<(), Error> {
                 let query = format!("SELECT {}, {} FROM {}", col1, col2, table_name);
                 println!("Query: {}", query);
                 
-                match db.execute_sql(&query) {
+                match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                     Ok(rows) => {
                         println!("Found {} rows:", rows.len());
                         for (i, row) in rows.iter().take(3).enumerate() {
@@ -85,7 +85,7 @@ fn main() -> Result<(), Error> {
                     let query = format!("SELECT * FROM {} WHERE {} > {}", table_name, column, int_val - 1);
                     println!("Query: {}", query);
                     
-                    match db.execute_sql(&query) {
+                    match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                         Ok(rows) => {
                             println!("Found {} rows matching condition:", rows.len());
                             for (i, row) in rows.iter().take(2).enumerate() {
@@ -110,7 +110,7 @@ fn main() -> Result<(), Error> {
                 let query = format!("SELECT * FROM {} ORDER BY {} DESC", table_name, order_column);
                 println!("Query: {}", query);
                 
-                match db.execute_sql(&query) {
+                match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                     Ok(rows) => {
                         println!("Found {} rows (ordered):", rows.len());
                         for (i, row) in rows.iter().take(3).enumerate() {
@@ -128,7 +128,7 @@ fn main() -> Result<(), Error> {
     let query = format!("SELECT * FROM {} LIMIT 5", table_name);
     println!("Query: {}", query);
     
-    match db.execute_sql(&query) {
+    match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
         Ok(rows) => {
             println!("Found {} rows (limited to 5):", rows.len());
             for (i, row) in rows.iter().enumerate() {
@@ -157,7 +157,7 @@ fn main() -> Result<(), Error> {
                             );
                             println!("Query: {}", query);
                             
-                            match db.execute_sql(&query) {
+                            match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                                 Ok(rows) => {
                                     println!("Found {} rows:", rows.len());
                                     for (i, row) in rows.iter().enumerate() {
@@ -185,7 +185,7 @@ fn main() -> Result<(), Error> {
                         let query = format!("SELECT * FROM {} WHERE {} LIKE '{}%'", table_name, column, prefix);
                         println!("Query: {}", query);
                         
-                        match db.execute_sql(&query) {
+                        match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                             Ok(rows) => {
                                 println!("Found {} rows matching pattern:", rows.len());
                                 for (i, row) in rows.iter().take(2).enumerate() {
@@ -211,7 +211,7 @@ fn main() -> Result<(), Error> {
                         table_name, column, int_val, column, int_val + 1);
                     println!("Query: {}", query);
                     
-                    match db.execute_sql(&query) {
+                    match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                         Ok(rows) => {
                             println!("Found {} rows matching OR condition:", rows.len());
                             for (i, row) in rows.iter().take(3).enumerate() {
@@ -236,7 +236,7 @@ fn main() -> Result<(), Error> {
                         table_name, column, int_val, int_val + 1, int_val + 2);
                     println!("Query: {}", query);
                     
-                    match db.execute_sql(&query) {
+                    match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                         Ok(rows) => {
                             println!("Found {} rows matching IN condition:", rows.len());
                             for (i, row) in rows.iter().take(3).enumerate() {
@@ -261,7 +261,7 @@ fn main() -> Result<(), Error> {
                         table_name, column, int_val, int_val + 5);
                     println!("Query: {}", query);
                     
-                    match db.execute_sql(&query) {
+                    match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                         Ok(rows) => {
                             println!("Found {} rows matching BETWEEN condition:", rows.len());
                             for (i, row) in rows.iter().take(3).enumerate() {
@@ -286,7 +286,7 @@ fn main() -> Result<(), Error> {
                         table_name, column, int_val);
                     println!("Query: {}", query);
                     
-                    match db.execute_sql(&query) {
+                    match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                         Ok(rows) => {
                             println!("Found {} rows matching NOT condition:", rows.len());
                             for (i, row) in rows.iter().take(3).enumerate() {
@@ -320,7 +320,7 @@ fn main() -> Result<(), Error> {
                             );
                             println!("Query: {}", query);
                             
-                            match db.execute_sql(&query) {
+                            match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                                 Ok(rows) => {
                                     println!("Found {} rows matching complex condition:", rows.len());
                                     for (i, row) in rows.iter().take(3).enumerate() {
@@ -349,7 +349,7 @@ fn main() -> Result<(), Error> {
                 let query = format!("SELECT * FROM {} WHERE {} IS NULL", table_name, column);
                 println!("Query: {}", query);
                 
-                match db.execute_sql(&query) {
+                match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                     Ok(rows) => {
                         println!("Found {} rows with NULL values:", rows.len());
                         for (i, row) in rows.iter().take(3).enumerate() {
@@ -372,7 +372,7 @@ fn main() -> Result<(), Error> {
                 let query = format!("SELECT * FROM {} WHERE {} IS NOT NULL LIMIT 3", table_name, column);
                 println!("Query: {}", query);
                 
-                match db.execute_sql(&query) {
+                match SelectQuery::parse(&query).and_then(|q| db.execute_query(&q)) {
                     Ok(rows) => {
                         println!("Found {} rows with non-NULL values:", rows.len());
                         for (i, row) in rows.iter().enumerate() {

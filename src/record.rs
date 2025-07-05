@@ -87,7 +87,7 @@ pub fn parse_record(payload: &[u8]) -> Result<Vec<Value>> {
 }
 
 /// Parse a value based on its serial type
-fn parse_value(serial_type: i64, data: &[u8]) -> Result<(Value, usize)> {
+pub fn parse_value(serial_type: i64, data: &[u8]) -> Result<(Value, usize)> {
     match serial_type {
         0 => Ok((Value::Null, 0)),
         1 => {

@@ -4,7 +4,9 @@
 use alloc::{string::String, vec::Vec};
 
 /// Represents a value stored in SQLite
-#[derive(Debug, Clone, PartialEq)]
+// f64 does not implement Eq or Ord, so we must implement them manually.
+// We derive PartialOrd and use it to implement Ord.
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
 pub enum Value {
     /// NULL value
     Null,
@@ -18,12 +20,28 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
+// Manual implementation of Eq, required for Ord.
+// This is safe as long as we don't have NaN values for f64,
+// which is a reasonable assumption for a database.
+impl Eq for Value {}
+
+// Manual implementation of Ord, required for B-tree key comparisons.
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or_else(|| {
+            // The derived partial_cmp will return None if a f64 is NaN.
+            // We panic here because NaN values are not supported in comparisons.
+            panic!("Attempted to compare NaN values, which is not supported.");
+        })
+    }
+}
+
 impl Value {
     /// Returns true if this value is NULL
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
-    
+
     /// Try to get this value as an integer
     pub fn as_integer(&self) -> Option<i64> {
         match self {
@@ -31,7 +49,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Try to get this value as a float
     pub fn as_real(&self) -> Option<f64> {
         match self {
@@ -40,7 +58,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Try to get this value as text
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -48,11 +66,19 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Try to get this value as a blob
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             Value::Blob(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Try to get this value as a boolean
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Integer(i) => Some(*i != 0),
             _ => None,
         }
     }
@@ -156,4 +182,4 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original, cloned);
     }
-} 
+}

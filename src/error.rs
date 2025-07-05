@@ -11,6 +11,9 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Errors that can occur when reading SQLite databases
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Error related to database schema
+    #[error("Schema error: {0}")]
+    SchemaError(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     
