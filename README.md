@@ -2,9 +2,9 @@
 
 A pure Rust SQLite reader library designed for WASI (WebAssembly System Interface) environments. This library provides read-only access to SQLite databases without any C dependencies, making it perfect for WebAssembly applications running in WasmTime or other WASI-compatible runtimes.
 
-## Version 0.2.0
+## Version 0.3.0
 
-This version introduces comprehensive SQL query support with enhanced WHERE clause capabilities including logical operators (`AND`, `OR`, `NOT`), null checks (`IS NULL`, `IS NOT NULL`), membership testing (`IN`), range queries (`BETWEEN`), and complex expressions with parentheses.
+This version introduces comprehensive SQL query support with enhanced WHERE clause capabilities including logical operators (`AND`, `OR`, `NOT`), null checks (`IS NULL`, `IS NOT NULL`), membership testing (`IN`), range queries (`BETWEEN`), pattern matching (`LIKE`), and complex expressions with parentheses.
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed release information.
 
@@ -18,6 +18,9 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release information.
 - **Robust B-tree Traversal**: Proper in-order traversal with cycle detection
 - **Memory Efficient**: Designed to handle large databases with limited memory constraints
 - **Simple API**: Easy-to-use interface for reading tables and data
+- **Deterministic Results**: Consistent query results across different runs and environments
+- **Robust Data Handling**: Graceful handling of edge cases like NaN values without runtime panics
+- **Performance Optimized**: Minimized memory allocations and optimized page parsing for better performance
 
 ## Why Read-Only?
 
@@ -52,10 +55,11 @@ This library is specifically designed for the following scenarios:
 ```rust
 // Process SQLite data in a WASI environment
 use sqlite_wasm_reader::{Database, Error};
+use sqlite_wasm_reader::query::SelectQuery;
 
 fn analyze_user_data(db_path: &str) -> Result<(), Error> {
     let mut db = Database::open(db_path)?;
-    let users = db.read_table("users")?;
+    let users = db.execute_query(&SelectQuery::parse("SELECT * FROM users")?)?;
     
     // Perform analysis without modifying the database
     for user in users {
@@ -80,7 +84,7 @@ fn analyze_user_data(db_path: &str) -> Result<(), Error> {
 // Extract data from SQLite for ETL processes
 fn extract_table_data(db_path: &str, table_name: &str) -> Result<Vec<Row>, Error> {
     let mut db = Database::open(db_path)?;
-    db.read_table(table_name)
+    db.execute_query(&SelectQuery::parse(&format!("SELECT * FROM {}", table_name))?)
 }
 ```
 
@@ -123,7 +127,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sqlite_wasm_reader = "0.2.0"
+sqlite_wasm_reader = "0.3.0"
 ```
 
 ## Quick Start
@@ -144,8 +148,9 @@ fn main() -> Result<(), Error> {
         println!("Table: {}", table);
     }
     
-    // Read all rows from a table
-    let rows = db.read_table("users")?;
+    // Execute a query using indexes
+    let query = SelectQuery::parse("SELECT * FROM users WHERE id = 1")?;
+    let rows = db.execute_query(&query)?;
     for row in rows {
         println!("{:?}", row);
     }
@@ -186,48 +191,77 @@ let mut db = Database::open("path/to/database.db")?;
 // List all tables
 let tables = db.tables()?;
 
-// Read all rows from a table
-let rows = db.read_table("table_name")?;
-
-// Read limited number of rows (useful for large tables)
-let rows = db.read_table_limited("table_name", 1000)?;
+// Execute a query using indexes
+let query = SelectQuery::parse("SELECT * FROM table_name WHERE column = 'value'")?;
+let rows = db.execute_query(&query)?;
 
 // Count rows in a table efficiently
 let count = db.count_table_rows("table_name")?;
 ```
 
-### SQL Query Support
+### Query Builder Helpers
 
-The library supports comprehensive SQL SELECT queries with WHERE clauses:
+For programmatic construction of `SELECT` queries without writing raw SQL, use the fluent helper API:
 
 ```rust
-// Execute SQL queries
-let rows = db.execute_sql("SELECT * FROM users WHERE age > 18")?;
+use sqlite_wasm_reader::{query::{SelectQuery, Expr}, Value};
 
-// Complex WHERE clauses with logical operators
-let rows = db.execute_sql("SELECT * FROM users WHERE age > 18 AND status = 'active'")?;
+let query = SelectQuery::new("users")
+    .select_columns(vec!["id".into(), "name".into()])
+    .with_where(
+        Expr::eq("status", Value::Text("active".into()))
+            .and(Expr::between("age", Value::Integer(18), Value::Integer(65)))
+            .or(Expr::is_null("deleted_at"))
+    )
+    .with_order_by("name", true)
+    .with_limit(100);
 
-// OR conditions
-let rows = db.execute_sql("SELECT * FROM users WHERE age = 25 OR age = 30")?;
-
-// IN clauses
-let rows = db.execute_sql("SELECT * FROM users WHERE age IN (25, 30, 35)")?;
-
-// BETWEEN ranges
-let rows = db.execute_sql("SELECT * FROM users WHERE age BETWEEN 20 AND 30")?;
-
-// NULL checks
-let rows = db.execute_sql("SELECT * FROM users WHERE email IS NOT NULL")?;
-
-// Complex expressions with parentheses
-let rows = db.execute_sql("SELECT * FROM users WHERE (age > 18 OR age < 65) AND status = 'active'")?;
-
-// LIKE patterns
-let rows = db.execute_sql("SELECT * FROM users WHERE name LIKE 'John%'")?;
-
-// ORDER BY and LIMIT
-let rows = db.execute_sql("SELECT * FROM users ORDER BY age DESC LIMIT 10")?;
+let rows = db.execute_query(&query)?;
 ```
+
+### SQL Query Support
+
+`sqlite_wasm_reader` lets you query data either by parsing raw SQL _or_ by constructing `SelectQuery` objects directly and executing them with `Database::execute_query()`.
+
+```rust
+use sqlite_wasm_reader::{Database, Error};
+use sqlite_wasm_reader::query::SelectQuery;
+use sqlite_wasm_reader::query::{SelectQuery, Expr};
+use sqlite_wasm_reader::value::Value;
+
+fn complex_report(db: &mut Database) -> Result<(), Error> {
+    // Option 1. Parse raw SQL, then execute
+    let raw = "SELECT * FROM users WHERE age > 18 AND status = 'active' ORDER BY name LIMIT 10";
+    let parsed = SelectQuery::parse(raw)?;
+    let rows = db.execute_query(&parsed)?;
+    println!("{} rows (raw SQL): {}", rows.len(), raw);
+
+    // Option 2. Build programmatically using helpers
+    let builder = SelectQuery::new("users")
+        .select_columns(vec!["id".into(), "name".into(), "age".into()])
+        .with_where(
+            Expr::gt("age", Value::Integer(18))
+                .and(Expr::eq("status", Value::Text("active".into())))
+        )
+        .with_order_by("name", true)
+        .with_limit(10);
+
+    let rows = db.execute_query(&builder)?;
+    println!("{} rows (builder API)", rows.len());
+
+    Ok(())
+}
+```
+
+Both paths end in a call to `execute_query`, which accepts any `SelectQuery` (parsed or manually constructed). This method uses intelligent query processing:
+
+* **Index Acceleration**: Automatically uses available indexes for exact equality matches when suitable indexes exist
+* **Table Scan Fallback**: Seamlessly falls back to full table scans when no suitable index is found, ensuring all queries work
+* **WHERE filtering** with logical operators (`AND`, `OR`, `NOT`), `LIKE`, `IN`, `BETWEEN`, `IS NULL` / `IS NOT NULL`, and parentheses
+* **Column projection** (`SELECT *` or explicit columns)
+* **`ORDER BY` and `LIMIT`** processing in memory
+
+Use whichever style (raw SQL vs builder) best fits your workflow.
 
 ### Value Types
 
@@ -309,7 +343,7 @@ fn main() -> Result<(), Error> {
     let mut db = Database::open("users.db")?;
     
     // Read user table
-    let users = db.read_table("users")?;
+    let users = db.execute_query(&SelectQuery::parse("SELECT * FROM users")?)?;
     
     for user in users {
         let name = user.get("name").unwrap_or(&Value::Null);
@@ -322,38 +356,11 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-### Large Table Handling
-
-```rust
-use sqlite_wasm_reader::{Database, Error};
-
-fn main() -> Result<(), Error> {
-    let mut db = Database::open("large_database.db")?;
-    
-    // For large tables, use limited reading
-    let batch_size = 1000;
-    let mut offset = 0;
-    
-    loop {
-        let rows = db.read_table_limited("large_table", batch_size)?;
-        if rows.is_empty() {
-            break;
-        }
-        
-        println!("Processing batch of {} rows", rows.len());
-        // Process rows...
-        
-        offset += rows.len();
-    }
-    
-    Ok(())
-}
-```
-
 ### Efficient Row Counting
 
 ```rust
 use sqlite_wasm_reader::{Database, Error};
+use sqlite_wasm_reader::query::SelectQuery;
 
 fn main() -> Result<(), Error> {
     let mut db = Database::open("database.db")?;
@@ -416,9 +423,9 @@ wasmtime run --dir=. target/wasm32-wasip1/debug/examples/wasi_example.wasm -- da
 
 - **Read-Only**: This library only supports reading SQLite databases, not writing
 - **Basic SQL Types**: Supports NULL, INTEGER, REAL, TEXT, and BLOB types
-- **No Index Support**: Currently doesn't support reading from indexes
+- **Partial Index Support**: Uses indexes for exact equality matches when available, falls back to table scans for complex queries or when no suitable index exists
 - **Simple Schema Parsing**: Basic CREATE TABLE parsing for column names
-- **Memory Constraints**: Large databases may require using `read_table_limited()` to avoid memory issues
+- **Memory Constraints**: Executing `SELECT *` on very large tables can be memory-intensive. Prefer filtering with WHERE clauses and/or fetching data in smaller chunks using `LIMIT` / `OFFSET` whenever possible.
 
 ## Architecture
 
@@ -435,7 +442,7 @@ The library is structured into several modules:
 
 ## Performance Considerations
 
-- **Memory Usage**: For large databases, use `read_table_limited()` to control memory usage
+- **Memory Usage**: For huge datasets, process data in pages via repeated queries with `LIMIT` / `OFFSET`, or add selective WHERE conditions to minimize the rows materialized at once.
 - **B-tree Traversal**: The library uses efficient in-order traversal with cycle detection
 - **Logging Overhead**: Set appropriate log levels to minimize performance impact
 - **WASI Environment**: Optimized for WebAssembly environments with limited resources
@@ -447,6 +454,7 @@ The library provides comprehensive error handling:
 
 ```rust
 use sqlite_wasm_reader::{Database, Error};
+use sqlite_wasm_reader::query::SelectQuery;
 
 match Database::open("database.db") {
     Ok(mut db) => {
@@ -466,6 +474,33 @@ match Database::open("database.db") {
     }
 }
 ```
+
+## Robustness Features
+
+The library is designed for production use with several robustness features:
+
+### **Deterministic Query Results**
+- Index-based queries return results in consistent, sorted order
+- No unpredictable row ordering that could cause flaky tests or inconsistent behavior
+- Reliable for applications that depend on consistent data presentation
+
+### **Robust Data Handling**
+- Graceful handling of NaN values in floating-point comparisons
+- No runtime panics on valid SQLite data
+- Proper error recovery for malformed records
+- Safe handling of edge cases and corrupted data
+
+### **Memory Safety**
+- Optimized memory usage with minimal allocations
+- Cycle detection in B-tree traversal to prevent infinite loops
+- Bounds checking to prevent buffer overflows
+- Safe handling of large databases with limited memory constraints
+
+### **Error Recovery**
+- Comprehensive error types for different failure scenarios
+- Graceful degradation when encountering problematic data
+- Detailed logging for debugging and monitoring
+- Safe fallbacks when optimal paths fail
 
 ## License
 

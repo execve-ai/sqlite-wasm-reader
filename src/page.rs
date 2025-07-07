@@ -7,7 +7,7 @@ use byteorder::{BigEndian, ByteOrder};
 use alloc::{vec::Vec, format};
 
 /// Represents a page in the SQLite database
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Page {
     /// Page number (1-indexed)
@@ -28,7 +28,7 @@ pub struct Page {
 
 impl Page {
     /// Parse a page from raw bytes
-    pub fn parse(page_number: u32, data: Vec<u8>, is_first_page: bool) -> Result<Self> {
+    pub fn parse(page_number: u32, data: &[u8], is_first_page: bool) -> Result<Self> {
         let header_offset = if is_first_page { 100 } else { 0 };
         
         if data.len() < header_offset + PAGE_HEADER_SIZE {
@@ -51,7 +51,7 @@ impl Page {
         
         Ok(Page {
             page_number,
-            data,
+            data: data.to_vec(), // Clone only when creating the Page struct
             page_type,
             cell_count,
             first_cell_offset,

@@ -4,6 +4,8 @@
 use alloc::{string::String, vec::Vec};
 
 /// Represents a value stored in SQLite
+// f64 does not implement Eq or Ord, so we must implement them manually.
+// We implement PartialOrd and Ord manually to handle NaN values robustly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// NULL value
@@ -18,12 +20,63 @@ pub enum Value {
     Blob(Vec<u8>),
 }
 
+// Manual implementation of Eq, required for Ord.
+// This is safe as long as we don't have NaN values for f64,
+// which is a reasonable assumption for a database.
+impl Eq for Value {}
+
+// Manual implementation of PartialOrd to handle NaN values robustly
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Real(a), Value::Real(b)) => {
+                // Handle NaN values deterministically
+                if a.is_nan() && b.is_nan() {
+                    Some(std::cmp::Ordering::Equal)
+                } else if a.is_nan() {
+                    Some(std::cmp::Ordering::Less)
+                } else if b.is_nan() {
+                    Some(std::cmp::Ordering::Greater)
+                } else {
+                    a.partial_cmp(b)
+                }
+            }
+            _ => {
+                // For non-Real values, use the standard comparison
+                match (self, other) {
+                    (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+                    (Value::Null, _) => Some(std::cmp::Ordering::Less),
+                    (_, Value::Null) => Some(std::cmp::Ordering::Greater),
+                    (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+                    (Value::Integer(a), Value::Real(b)) => {
+                        if b.is_nan() {
+                            Some(std::cmp::Ordering::Greater)
+                        } else {
+                            (*a as f64).partial_cmp(b)
+                        }
+                    }
+                    (Value::Real(a), Value::Integer(b)) => {
+                        if a.is_nan() {
+                            Some(std::cmp::Ordering::Less)
+                        } else {
+                            a.partial_cmp(&(*b as f64))
+                        }
+                    }
+                    (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+                    (Value::Blob(a), Value::Blob(b)) => Some(a.cmp(b)),
+                    _ => None, // Different types are not comparable
+                }
+            }
+        }
+    }
+}
+
 impl Value {
     /// Returns true if this value is NULL
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
-    
+
     /// Try to get this value as an integer
     pub fn as_integer(&self) -> Option<i64> {
         match self {
@@ -31,7 +84,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Try to get this value as a float
     pub fn as_real(&self) -> Option<f64> {
         match self {
@@ -40,7 +93,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Try to get this value as text
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -48,11 +101,19 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Try to get this value as a blob
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
             Value::Blob(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Try to get this value as a boolean
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Integer(i) => Some(*i != 0),
             _ => None,
         }
     }
@@ -67,6 +128,13 @@ impl core::fmt::Display for Value {
             Value::Text(s) => write!(f, "{}", s),
             Value::Blob(b) => write!(f, "BLOB({} bytes)", b.len()),
         }
+    }
+}
+
+// Manual implementation of Ord, required for B-tree key comparisons.
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -156,4 +224,35 @@ mod tests {
         let cloned = original.clone();
         assert_eq!(original, cloned);
     }
-} 
+
+    #[test]
+    fn test_nan_handling() {
+        use std::f64;
+        
+        let nan = Value::Real(f64::NAN);
+        let pos_inf = Value::Real(f64::INFINITY);
+        let neg_inf = Value::Real(f64::NEG_INFINITY);
+        let normal = Value::Real(3.14);
+        let integer = Value::Integer(42);
+        
+        // NaN should be less than all other values
+        assert!(nan < pos_inf);
+        assert!(nan < neg_inf);
+        assert!(nan < normal);
+        assert!(nan < integer);
+        
+        // NaN should equal NaN
+        assert_eq!(nan.cmp(&nan), std::cmp::Ordering::Equal);
+        
+        // Other values should be greater than NaN
+        assert!(pos_inf > nan);
+        assert!(neg_inf > nan);
+        assert!(normal > nan);
+        assert!(integer > nan);
+        
+        // Normal comparisons should still work
+        assert!(normal < pos_inf);
+        assert!(normal > neg_inf);
+        assert!(integer > normal); // 42 > 3.14 in SQLite's numeric comparison
+    }
+}

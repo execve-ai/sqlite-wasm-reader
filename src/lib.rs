@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use sqlite_wasm_reader::{Database, Error};
+//! use sqlite_wasm_reader::{Database, Error, SelectQuery};
 //!
 //! fn main() -> Result<(), Error> {
 //!     let mut db = Database::open("example.db")?;
@@ -19,8 +19,9 @@
 //!         println!("Table: {}", table);
 //!     }
 //!     
-//!     // Read all rows from a table
-//!     let rows = db.read_table("users")?;
+//!     // Execute a query using indexes
+//!     let query = SelectQuery::parse("SELECT * FROM users WHERE id = 1")?;
+//!     let rows = db.execute_query(&query)?;
 //!     for row in rows {
 //!         println!("{:?}", row);
 //!     }

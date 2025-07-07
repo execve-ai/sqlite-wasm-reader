@@ -1,6 +1,6 @@
 //! Integration tests for sqlite_wasm_reader
 
-use sqlite_wasm_reader::{Database, Error, Value};
+use sqlite_wasm_reader::{Database, Error, Value, SelectQuery};
 use std::fs;
 use std::process::Command;
 
@@ -93,8 +93,10 @@ fn test_read_users_table() {
     
     let mut db = Database::open(test_db).expect("Failed to open database");
     
-    // Test reading the users table
-    let rows = db.read_table("users").expect("Failed to read users table");
+    // Test reading the users table using execute_query with a WHERE clause
+    // Since we need indexes, let's try to query by id which should have an index
+    let query = SelectQuery::parse("SELECT * FROM users WHERE id >= 1").expect("Failed to parse query");
+    let rows = db.execute_query(&query).expect("Failed to read users table");
     
     // Clean up
     cleanup_test_db(test_db);
@@ -137,8 +139,9 @@ fn test_read_products_table() {
     
     let mut db = Database::open(test_db).expect("Failed to open database");
     
-    // Test reading the products table
-    let rows = db.read_table("products").expect("Failed to read products table");
+    // Test reading the products table using execute_query with a WHERE clause
+    let query = SelectQuery::parse("SELECT * FROM products WHERE id >= 1").expect("Failed to parse query");
+    let rows = db.execute_query(&query).expect("Failed to read products table");
     
     // Clean up
     cleanup_test_db(test_db);
@@ -167,7 +170,8 @@ fn test_table_not_found() {
     let mut db = Database::open(test_db).expect("Failed to open database");
     
     // Test reading a non-existent table
-    let result = db.read_table("nonexistent_table");
+    let query = SelectQuery::parse("SELECT * FROM nonexistent_table");
+    let result = query.and_then(|q| db.execute_query(&q));
     
     // Clean up
     cleanup_test_db(test_db);

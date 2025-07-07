@@ -48,30 +48,19 @@ fn main() -> Result<(), Error> {
             }
         }
         
-        match db.read_table(first_table) {
+        // Try to execute a query to get sample data
+        match db.execute_query(&sqlite_wasm_reader::SelectQuery::parse(&format!("SELECT * FROM {} LIMIT 5", first_table))?) {
             Ok(rows) => {
-                println!("  Found {} rows", rows.len());
-                log_info(&format!("Successfully read {} rows from table {}", rows.len(), first_table));
+                println!("  Found {} rows (showing first 5)", rows.len());
+                log_info(&format!("Successfully queried {} rows from table {}", rows.len(), first_table));
                 
-                // Print first few rows
-                let rows_to_show = if rows.len() > 5 {
-                    println!("  (showing first 5 rows)");
-                    &rows[..5]
-                } else {
-                    &rows[..]
-                };
-                
-                for (i, row) in rows_to_show.iter().enumerate() {
+                for (i, row) in rows.iter().enumerate() {
                     println!("  Row {}: {:?}", i + 1, row);
-                }
-                
-                if rows.len() > 5 {
-                    println!("  ... and {} more rows", rows.len() - 5);
                 }
             }
             Err(e) => {
-                eprintln!("  Error reading table: {}", e);
-                log_info(&format!("Failed to read table {}: {}", first_table, e));
+                eprintln!("  Error querying table: {} (table may not have suitable indexes)", e);
+                log_info(&format!("Failed to query table {}: {}", first_table, e));
             }
         }
     }

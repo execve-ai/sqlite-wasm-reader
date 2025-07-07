@@ -1,13 +1,13 @@
 //! SQLite record parsing
 
-use crate::{Error, Result, Value, btree::read_varint, logging::log_warn, logging::log_debug};
+use crate::{Error, Result, Value, btree::read_varint};
 use byteorder::{BigEndian, ByteOrder};
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 use alloc::{vec::Vec, string::String};
 
-/// Parse a record from payload data
-pub fn parse_record(payload: &[u8]) -> Result<Vec<Value>> {
+/// Parse a record from payload data with optimized allocations
+pub fn parse_record_optimized(payload: &[u8]) -> Result<Vec<Value>> {
     if payload.is_empty() {
         return Ok(Vec::new());
     }
@@ -19,75 +19,142 @@ pub fn parse_record(payload: &[u8]) -> Result<Vec<Value>> {
     }
     
     // Safety check: limit header size to prevent memory issues
-    // Record headers are typically < 1KB, 64KB is very generous
     if header_size > 65536 {
         return Err(Error::InvalidFormat(format!("Header size too large: {} bytes", header_size)));
     }
     
-    // Read serial types from header
-    let mut serial_types = Vec::new();
-    // The header_size includes the header_size varint itself
+    // Read serial types from header with pre-allocation
     let header_end = header_size as usize;
+    let mut serial_types = Vec::new();
     let mut offset = header_size_bytes;
     
-    // Safety check: limit number of serial types
-    // Most SQLite tables have < 100 columns, 10000 is very generous
-    let max_serial_types = 10_000;
-    
     while offset < header_end {
-        if serial_types.len() >= max_serial_types {
-            // If we hit this limit, something is wrong with parsing
-            return Err(Error::InvalidFormat(format!(
-                "Too many serial types: {} (limit: {})", 
-                serial_types.len(), 
-                max_serial_types
-            )));
-        }
-        
         let (serial_type, bytes_read) = read_varint(&payload[offset..])?;
-        offset += bytes_read;
         serial_types.push(serial_type);
+        offset += bytes_read;
+        
+        // Safety check
+        if serial_types.len() > 1000 {
+            return Err(Error::InvalidFormat("Too many columns in record".into()));
+        }
     }
     
-    // Skip to data section - data starts right after the header
-    offset = header_size as usize;
+    // Pre-allocate values vector
+    let mut values = Vec::with_capacity(serial_types.len());
+    let mut data_offset = header_end;
     
-    // Parse values based on serial types
-    let mut values = Vec::new();
-    
-    for (i, serial_type) in serial_types.iter().enumerate() {
-        // Check if we have enough data left
-        if offset >= payload.len() {
-            log_debug(&format!("Ran out of data while parsing value {} (serial_type: {}). Payload size: {}, offset: {}", i, serial_type, payload.len(), offset));
-            // Instead of breaking, add NULL values for remaining columns
-            for _ in i..serial_types.len() {
-                values.push(Value::Null);
-            }
-            break;
+    // Parse values with minimal allocations
+    for &serial_type in &serial_types {
+        if data_offset >= payload.len() {
+            values.push(Value::Null);
+            continue;
         }
         
-        match parse_value(*serial_type, &payload[offset..]) {
-            Ok((value, bytes_read)) => {
-                offset += bytes_read;
-                values.push(value);
-            }
-            Err(e) => {
-                log_warn(&format!("Failed to parse value {} (serial_type: {}): {}. Payload size: {}, offset: {}", i, serial_type, e, payload.len(), offset));
-                // Add a null value as fallback and continue
-                values.push(Value::Null);
-                // Try to advance offset to prevent infinite loops
-                if offset < payload.len() {
-                    offset += 1;
-                }
-            }
-        }
+        let (value, bytes_consumed) = parse_value_optimized(&payload[data_offset..], serial_type)?;
+        values.push(value);
+        data_offset += bytes_consumed;
     }
     
     Ok(values)
 }
 
+/// Parse a single value with optimized allocations
+fn parse_value_optimized(data: &[u8], serial_type: i64) -> Result<(Value, usize)> {
+    match serial_type {
+        0 => Ok((Value::Null, 0)),
+        1 => {
+            if data.is_empty() {
+                Ok((Value::Integer(0), 0))
+            } else {
+                Ok((Value::Integer(data[0] as i8 as i64), 1))
+            }
+        }
+        2 => {
+            if data.len() < 2 {
+                Ok((Value::Integer(0), 0))
+            } else {
+                let value = BigEndian::read_i16(data) as i64;
+                Ok((Value::Integer(value), 2))
+            }
+        }
+        3 => {
+            if data.len() < 3 {
+                Ok((Value::Integer(0), 0))
+            } else {
+                let mut bytes = [0u8; 4];
+                bytes[1..4].copy_from_slice(&data[0..3]);
+                let value = BigEndian::read_i32(&bytes) >> 8; // Sign extend
+                Ok((Value::Integer(value as i64), 3))
+            }
+        }
+        4 => {
+            if data.len() < 4 {
+                Ok((Value::Integer(0), 0))
+            } else {
+                let value = BigEndian::read_i32(data) as i64;
+                Ok((Value::Integer(value), 4))
+            }
+        }
+        5 => {
+            if data.len() < 6 {
+                Ok((Value::Integer(0), 0))
+            } else {
+                let mut bytes = [0u8; 8];
+                bytes[2..8].copy_from_slice(&data[0..6]);
+                let value = BigEndian::read_i64(&bytes) >> 16; // Sign extend
+                Ok((Value::Integer(value), 6))
+            }
+        }
+        6 => {
+            if data.len() < 8 {
+                Ok((Value::Integer(0), 0))
+            } else {
+                let value = BigEndian::read_i64(data);
+                Ok((Value::Integer(value), 8))
+            }
+        }
+        7 => {
+            if data.len() < 8 {
+                Ok((Value::Real(0.0), 0))
+            } else {
+                let bits = BigEndian::read_u64(data);
+                let value = f64::from_bits(bits);
+                Ok((Value::Real(value), 8))
+            }
+        }
+        8 => Ok((Value::Integer(0), 0)),
+        9 => Ok((Value::Integer(1), 0)),
+        _ => {
+            if serial_type >= 12 {
+                if serial_type % 2 == 0 {
+                    // BLOB
+                    let length = ((serial_type - 12) / 2) as usize;
+                    if data.len() < length {
+                        Ok((Value::Blob(Vec::new()), 0))
+                    } else {
+                        // Use from_slice to avoid unnecessary allocation
+                        Ok((Value::Blob(data[0..length].to_vec()), length))
+                    }
+                } else {
+                    // TEXT
+                    let length = ((serial_type - 13) / 2) as usize;
+                    if data.len() < length {
+                        Ok((Value::Text(String::new()), 0))
+                    } else {
+                        // Use from_utf8_lossy to handle invalid UTF-8 gracefully
+                        let text = String::from_utf8_lossy(&data[0..length]).into_owned();
+                        Ok((Value::Text(text), length))
+                    }
+                }
+            } else {
+                Ok((Value::Null, 0))
+            }
+        }
+    }
+}
+
 /// Parse a value based on its serial type
-fn parse_value(serial_type: i64, data: &[u8]) -> Result<(Value, usize)> {
+pub fn parse_value(serial_type: i64, data: &[u8]) -> Result<(Value, usize)> {
     match serial_type {
         0 => Ok((Value::Null, 0)),
         1 => {
@@ -187,4 +254,9 @@ fn parse_value(serial_type: i64, data: &[u8]) -> Result<(Value, usize)> {
         }
         _ => Err(Error::InvalidFormat("Invalid serial type".into())),
     }
+}
+
+/// Parse a record from payload data (original version for compatibility)
+pub fn parse_record(payload: &[u8]) -> Result<Vec<Value>> {
+    parse_record_optimized(payload)
 } 

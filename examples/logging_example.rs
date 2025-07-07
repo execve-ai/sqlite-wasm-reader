@@ -65,7 +65,8 @@ fn main() -> Result<(), Error> {
             }
         }
         
-        match db.read_table(&table) {
+        // Try to execute a query to get sample data
+        match db.execute_query(&sqlite_wasm_reader::SelectQuery::parse(&format!("SELECT * FROM {} LIMIT 10", table))?) {
             Ok(rows) => {
                 if rows.is_empty() {
                     println!("  Empty table");
@@ -73,8 +74,8 @@ fn main() -> Result<(), Error> {
                     continue;
                 }
                 
-                println!("  Found {} rows", rows.len());
-                log_info(&format!("Successfully read {} rows from table {}", rows.len(), table));
+                println!("  Found {} rows (showing first 10)", rows.len());
+                log_info(&format!("Successfully queried {} rows from table {}", rows.len(), table));
                 
                 // Analyze the first row to understand the schema
                 if let Some(first_row) = rows.first() {
@@ -94,28 +95,16 @@ fn main() -> Result<(), Error> {
                 }
                 
                 // Show sample data
-                let rows_to_show = if rows.len() > 3 {
-                    println!("  Sample data (first 3 rows):");
-                    &rows[..3]
-                } else {
-                    println!("  All data:");
-                    &rows[..]
-                };
-                
-                for (i, row) in rows_to_show.iter().enumerate() {
+                for (i, row) in rows.iter().enumerate() {
                     println!("    Row {}: {:?}", i + 1, row);
-                }
-                
-                if rows.len() > 3 {
-                    println!("    ... and {} more rows", rows.len() - 3);
                 }
                 
                 // Analyze data distribution
                 analyze_data_distribution(&rows);
             }
             Err(e) => {
-                log_warn(&format!("Failed to read table {}: {}", table, e));
-                eprintln!("  Error reading table: {}", e);
+                log_warn(&format!("Failed to query table {}: {} (table may not have suitable indexes)", table, e));
+                eprintln!("  Error querying table: {} (table may not have suitable indexes)", e);
             }
         }
     }

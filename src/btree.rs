@@ -1,6 +1,6 @@
 //! B-tree traversal functionality
 
-use crate::{Error, Result, page::Page, logging::log_warn, logging::log_debug};
+use crate::{Error, Result, page::Page, logging::log_warn, logging::log_debug, value::Value};
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 use alloc::vec::Vec;
@@ -17,11 +17,29 @@ pub struct Cell {
     pub payload: Vec<u8>,
 }
 
+/// An entry in an index B-tree
+#[derive(Debug)]
+struct IndexCell {
+    /// The indexed value(s)
+    pub key: Vec<Value>,
+    /// The rowid of the corresponding row
+    pub rowid: i64,
+}
+
+/// An entry in an interior index page
+#[derive(Debug)]
+struct InteriorIndexCell {
+    /// The page number of the left child.
+    pub left_child: u32,
+    /// The indexed value(s)
+    pub key: Vec<Value>,
+}
+
 /// B-tree cursor for traversing pages
 pub struct BTreeCursor {
     /// Stack of pages being traversed
-    /// Each entry contains: (page, current_cell_index, cells_processed)
-    page_stack: Vec<(Page, usize, bool)>,
+    /// Each entry contains: (page, current_cell_index)
+    page_stack: Vec<(Page, usize)>,
     /// Track visited pages to prevent infinite loops
     visited_pages: Vec<u32>,
     /// Safety counter to prevent infinite loops
@@ -33,9 +51,67 @@ impl BTreeCursor {
     pub fn new(root_page: Page) -> Self {
         let page_number = root_page.page_number;
         BTreeCursor {
-            page_stack: vec![(root_page, 0, false)],
+            page_stack: vec![(root_page, 0)],
             visited_pages: vec![page_number],
             iteration_count: 0,
+        }
+    }
+    
+    /// Find a cell with the specified key (ROWID) in the B-tree
+    pub fn find_cell<F>(&mut self, key: i64, mut read_page: F) -> Result<Option<Cell>>
+    where
+        F: FnMut(u32) -> Result<Page>,
+    {
+        if self.page_stack.is_empty() {
+            return Ok(None);
+        }
+
+        let root_page_num = self.page_stack[0].0.page_number;
+        let mut current_page = read_page(root_page_num)?;
+
+        loop {
+            if current_page.page_type.is_leaf() {
+                let cell_pointers = current_page.cell_pointers(current_page.page_number == 1)?;
+
+                // Binary search for the key in this leaf page
+                let mut low = 0;
+                let mut high = cell_pointers.len();
+
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    let cell_offset = cell_pointers[mid];
+                    let cell_data = current_page.cell_content(cell_offset)?;
+                    let cell = parse_leaf_table_cell(&cell_data)?;
+
+                    match cell.key.cmp(&key) {
+                        std::cmp::Ordering::Equal => return Ok(Some(cell)),
+                        std::cmp::Ordering::Less => low = mid + 1,
+                        std::cmp::Ordering::Greater => high = mid,
+                    }
+                }
+
+                // Key not found
+                return Ok(None);
+            } else {
+                // This is an interior page, find the appropriate child page to descend to.
+                let cell_pointers = current_page.cell_pointers(current_page.page_number == 1)?;
+
+                let mut next_page_num = current_page.right_pointer.ok_or_else(|| {
+                    Error::InvalidFormat("Interior page missing right pointer".into())
+                })?;
+
+                for &cell_offset in cell_pointers.iter() {
+                    let cell_data = current_page.cell_content(cell_offset)?;
+                    let cell = parse_interior_table_cell(&cell_data)?;
+                    if key <= cell.key {
+                        next_page_num = cell.left_child.unwrap();
+                        break;
+                    }
+                }
+
+                // Descend to the child page.
+                current_page = read_page(next_page_num)?;
+            }
         }
     }
     
@@ -55,7 +131,7 @@ impl BTreeCursor {
                 return Ok(None);
             }
             
-            let (page, cell_index, cells_processed) = self.page_stack.last_mut().unwrap();
+            let (page, cell_index) = self.page_stack.last_mut().unwrap();
             
             // If this is a leaf page
             if page.page_type.is_leaf() {
@@ -125,7 +201,7 @@ impl BTreeCursor {
                     
                     let right_page = read_page(right_ptr)?;
                     self.visited_pages.push(right_ptr);
-                    self.page_stack.push((right_page, 0, false));
+                    self.page_stack.push((right_page, 0));
                     continue;
                 }
                 
@@ -173,39 +249,140 @@ impl BTreeCursor {
                     continue;
                 }
             };
-            
-            // If we haven't processed the left child of this cell yet
-            if !*cells_processed {
-                // Mark that we've processed the left child
-                *cells_processed = true;
-                
-                // Push the left child page onto the stack
-                if let Some(left_child) = cell.left_child {
-                    // Safety check: prevent revisiting the same page
-                    if self.visited_pages.contains(&left_child) {
-                        // We're about to revisit a page, this indicates a cycle
-                        // Skip this left child and move to next cell
-                        *cell_index += 1;
-                        *cells_processed = false;
-                        continue;
-                    }
-                    
-                    let left_page = read_page(left_child)?;
+
+            // Move to next cell in this interior page for the next iteration
+            *cell_index += 1;
+
+            // Descend to the left child of this interior cell
+            if let Some(left_child) = cell.left_child {
+                // Prevent revisiting pages and potential infinite loops
+                if !self.visited_pages.contains(&left_child) {
+                    let child_page = match read_page(left_child) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log_warn(&format!("Failed to read child page {}: {}", left_child, e));
+                            continue;
+                        }
+                    };
                     self.visited_pages.push(left_child);
-                    self.page_stack.push((left_page, 0, false));
-                    continue;
+                    self.page_stack.push((child_page, 0));
                 }
             }
-            
-            // We've processed the left child, now move to the next cell in this interior page
-            // DO NOT return the interior cell - it's just for navigation
-            *cell_index += 1;
-            *cells_processed = false; // Reset for next cell
-            
-            // Continue to the next iteration to process the next cell
+
+            // Continue traversal with the newly pushed page (if any)
             continue;
         }
     }
+
+    /// Find all rowids for a composite index key (exact match on all components).
+    pub fn find_rowids_by_key<F>(&mut self, key: &[&Value], mut read_page: F) -> Result<Vec<i64>>
+    where
+        F: FnMut(u32) -> Result<Page>,
+    {
+        log_debug(&format!("[BTreeCursor] Searching for composite key: {:?}", key));
+        if self.page_stack.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let root_page_num = self.page_stack[0].0.page_number;
+        let mut current_page = read_page(root_page_num)?;
+
+        // Descend until we hit a leaf page in the index B-tree
+        loop {
+            if current_page.page_type.is_leaf() {
+                break;
+            }
+
+            let cell_pointers = current_page.cell_pointers(current_page.page_number == 1)?;
+            // By default, follow the right-most child ( > all keys )
+            let mut next_page_num = current_page
+                .right_pointer
+                .ok_or_else(|| Error::InvalidFormat("Interior index page missing right pointer".into()))?;
+
+            // Iterate over cells to find the first key >= search key (lexicographically by component)
+            for &cell_offset in &cell_pointers {
+                let cell_data = current_page.cell_content(cell_offset)?;
+                let cell = parse_interior_index_cell(&cell_data)?;
+                let cell_key_refs: Vec<&Value> = cell.key.iter().collect();
+
+                let cmp_len = std::cmp::min(key.len(), cell_key_refs.len());
+                let ord = key[..cmp_len].cmp(&cell_key_refs[..cmp_len]);
+                if ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal {
+                    next_page_num = cell.left_child;
+                    break;
+                }
+            }
+
+            current_page = read_page(next_page_num)?;
+        }
+
+        // We're now on a leaf page – gather all rowids whose key matches exactly
+        let mut rowids = Vec::new();
+        let cell_pointers = current_page.cell_pointers(current_page.page_number == 1)?;
+        
+        for &cell_offset in &cell_pointers {
+            let cell_data = current_page.cell_content(cell_offset)?;
+            let cell = parse_leaf_index_cell(&cell_data)?;
+
+            // Need at least as many components as the search key
+            if cell.key.len() < key.len() {
+                continue;
+            }
+            
+            // Exact component-wise equality for the prefix length of key
+            let matches = cell
+                .key
+                .iter()
+                .zip(key.iter())
+                .all(|(a, b)| a == *b);
+            
+            log_debug(&format!(
+                "[BTreeCursor] Checking cell: key={:?} vs search={:?}, matches={}",
+                cell.key, key, matches
+            ));
+            
+            if matches {
+                log_debug(&format!("[BTreeCursor] MATCH FOUND! Adding rowid {}", cell.rowid));
+                rowids.push(cell.rowid);
+            } else {
+                // Check if we've passed the search key alphabetically
+                // Since the page is sorted, if the current cell key is greater than the search key,
+                // no further cells will match
+                if let (Some(search_first), Some(cell_first)) = (key.first(), cell.key.first()) {
+                    match cell_first.cmp(search_first) {
+                        std::cmp::Ordering::Greater => {
+                            // We've passed the search key, stop searching
+                            log_debug(&format!(
+                                "[BTreeCursor] Cell key {:?} > search key {:?}, stopping early scan on page {}",
+                                cell.key, key, current_page.page_number
+                            ));
+                            break;
+                        },
+                        std::cmp::Ordering::Less => {
+                            // Cell key is less than search key, continue searching
+                            log_debug(&format!(
+                                "[BTreeCursor] Cell key {:?} < search key {:?}, continuing search",
+                                cell.key, key
+                            ));
+                        },
+                        std::cmp::Ordering::Equal => {
+                            // First component matches but full key doesn't - could be composite key mismatch
+                            log_debug(&format!(
+                                "[BTreeCursor] Partial composite key mismatch – cell key {:?} vs search {:?}",
+                                cell.key, key
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        log_debug(&format!(
+            "[BTreeCursor] Composite key search found {} rowids", rowids.len()
+        ));
+        Ok(rowids)
+    }
+
 }
 
 /// Parse a leaf table cell
@@ -252,6 +429,59 @@ fn parse_interior_table_cell(data: &[u8]) -> Result<Cell> {
     })
 }
 
+/// Parse a leaf index cell
+fn parse_leaf_index_cell(data: &[u8]) -> Result<IndexCell> {
+    let (payload_size, offset) = read_varint(data)?;
+    let payload = &data[offset..offset + payload_size as usize];
+    let (header_size, mut header_offset) = read_varint(payload)?;
+    let mut values = Vec::new();
+    let mut content_offset = header_size as usize;
+
+    while header_offset < header_size as usize {
+        let (serial_type, bytes_read) = read_varint(&payload[header_offset..])?;
+        header_offset += bytes_read;
+        let (value, value_bytes) = crate::record::parse_value(serial_type, &payload[content_offset..])?;
+        values.push(value);
+        content_offset += value_bytes;
+    }
+
+    // In SQLite index leaf cells, the ROWID is the last value in the payload
+    // Extract it from the values array
+    if values.is_empty() {
+        return Err(Error::InvalidFormat("Index cell has no values".into()));
+    }
+    
+    let rowid = match values.pop().unwrap() {
+        Value::Integer(id) => id,
+        _ => return Err(Error::InvalidFormat("Index cell ROWID is not an integer".into())),
+    };
+
+    Ok(IndexCell { key: values, rowid })
+}
+
+/// Parse an interior index cell
+fn parse_interior_index_cell(data: &[u8]) -> Result<InteriorIndexCell> {
+    let left_child = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let (payload_size, offset) = read_varint(&data[4..])?;
+    let payload = &data[4 + offset..4 + offset + payload_size as usize];
+    let (header_size, mut header_offset) = read_varint(payload)?;
+    let mut values = Vec::new();
+    let mut content_offset = header_size as usize;
+
+    while header_offset < header_size as usize {
+        let (serial_type, bytes_read) = read_varint(&payload[header_offset..])?;
+        header_offset += bytes_read;
+        let (value, value_bytes) = crate::record::parse_value(serial_type, &payload[content_offset..])?;
+        values.push(value);
+        content_offset += value_bytes;
+    }
+
+    Ok(InteriorIndexCell {
+        left_child,
+        key: values,
+    })
+}
+
 /// Read a variable-length integer
 pub fn read_varint(data: &[u8]) -> Result<(i64, usize)> {
     let mut value = 0i64;
@@ -277,4 +507,4 @@ pub fn read_varint(data: &[u8]) -> Result<(i64, usize)> {
     }
     
     Err(Error::InvalidVarint)
-} 
+}

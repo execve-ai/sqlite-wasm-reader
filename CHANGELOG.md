@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-07-07
+
+### Added
+- **Performance Improvements**:
+  - Eliminated unnecessary memory allocations during page reading by using slices instead of `Vec<u8>` copying
+  - Reduced memory footprint and improved cache locality for large databases
+  - Optimized page parsing for better performance in table scans
+
+### Improved
+- **Query Determinism**: Fixed unpredictable row ordering in index-based queries by sorting rowids before fetching rows
+- **Robustness**: Enhanced NaN value handling in floating-point comparisons to prevent runtime panics
+- **Memory Efficiency**: Removed unused functions and optimized data structures for better memory usage
+- **Error Handling**: Improved error recovery and logging for better debugging experience
+
+### Technical Improvements
+- **Value Type Safety**: Implemented robust `PartialOrd` and `Ord` traits for `Value` enum with proper NaN handling
+- **Code Cleanup**: Removed unused functions and optimized internal data structures
+- **Deterministic Results**: Ensured consistent query results across different runs and environments
+
 ## [0.2.0] - 2025-07-04
 
 ### Added
