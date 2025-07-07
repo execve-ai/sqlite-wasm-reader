@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use memmap2::Mmap;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use byteorder::{BigEndian, ByteOrder};
 
 use crate::{
@@ -26,17 +27,13 @@ pub type Row = HashMap<String, Value>;
 
 /// SQLite database reader
 pub struct Database {
-    mmap: Mmap,
+    file: BufReader<File>,
     header: FileHeader,
+    page_buffer: Vec<u8>,
     /// Cache of table schemas and their indexes
     schema_cache: HashMap<String, TableInfo>,
     /// Cache of recently read pages (page_number -> Page)
-    /// Limited to prevent excessive memory usage
-    page_cache: HashMap<u32, Page>,
-    /// Maximum number of pages to cache (LRU eviction)
-    max_cache_size: usize,
-    /// LRU ordering for page cache - tracks access order
-    page_lru_order: Vec<u32>,
+    page_cache: LruCache<u32, Page>,
     /// Interned column names to avoid string allocation during row creation
     column_name_cache: HashMap<String, String>,
 }
@@ -44,11 +41,12 @@ pub struct Database {
 impl Database {
     /// Open a SQLite database file
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Database> {
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
+        let mut file_buffered = BufReader::new(file);
         
         // Read and validate header
         let mut header_bytes = [0u8; 100];
-        file.read_exact(&mut header_bytes)?;
+        file_buffered.read_exact(&mut header_bytes)?;
         
         // Check magic string
         if &header_bytes[0..16] != SQLITE_HEADER_MAGIC {
@@ -56,17 +54,15 @@ impl Database {
         }
         
         let header = Self::parse_header(&header_bytes)?;
-        
-        // Create memory-mapped file for faster access
-        let mmap = unsafe { Mmap::map(&file)? };
-        
+        let page_size = header.page_size as usize;
+        let max_cache_size = 5000;
+
         let mut db = Database { 
-            mmap,
+            file: file_buffered,
             header,
+            page_buffer: vec![0; page_size],
             schema_cache: HashMap::new(),
-            page_cache: HashMap::new(),
-            max_cache_size: 5000, // Increased cache size significantly for table scans
-            page_lru_order: Vec::new(),
+            page_cache: LruCache::new(NonZeroUsize::new(max_cache_size).unwrap()),
             column_name_cache: HashMap::new(),
         };
         
@@ -243,36 +239,18 @@ impl Database {
         
         // Check cache first
         if let Some(page) = self.page_cache.get(&page_number) {
-            // Update LRU order - move to end (most recently used)
-            self.page_lru_order.retain(|&x| x != page_number);
-            self.page_lru_order.push(page_number);
             return Ok(page.clone());
         }
         
-        // Read from memory-mapped file (much faster than file I/O)
         let offset = (page_number - 1) as usize * self.header.page_size as usize;
-        let page_size = self.header.page_size as usize;
         
-        if offset + page_size > self.mmap.len() {
-            return Err(Error::InvalidPage(page_number));
-        }
+        // Read page data and create page
+        self.file.seek(SeekFrom::Start(offset as u64))?;
+        self.file.read_exact(&mut self.page_buffer)?;
+        let page = Page::parse(page_number, &self.page_buffer, page_number == 1)?;
         
-        let data = &self.mmap[offset..offset + page_size];
-        let page = Page::parse(page_number, data, page_number == 1)?;
-        
-        // For table scans, implement a more aggressive caching strategy
-        // Cache the page with proper LRU eviction
-        if self.page_cache.len() >= self.max_cache_size {
-            // Remove the least recently used page
-            if let Some(&oldest_page) = self.page_lru_order.first() {
-                self.page_cache.remove(&oldest_page);
-                self.page_lru_order.retain(|&x| x != oldest_page);
-            }
-        }
-        
-        // Insert the new page and update LRU order
-        self.page_cache.insert(page_number, page.clone());
-        self.page_lru_order.push(page_number);
+        // Cache the page
+        self.page_cache.put(page_number, page.clone());
         
         Ok(page)
     }
