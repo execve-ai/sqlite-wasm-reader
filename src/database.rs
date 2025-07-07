@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 use memmap2::Mmap;
 use byteorder::{BigEndian, ByteOrder};
 
 use crate::{
-    btree::{BTreeCursor, Cell},
+    btree::BTreeCursor,
     error::{Error, Result},
     format::{FileHeader, SQLITE_HEADER_MAGIC},
     logging::{log_debug, log_error, log_warn},
@@ -26,7 +26,6 @@ pub type Row = HashMap<String, Value>;
 
 /// SQLite database reader
 pub struct Database {
-    file: File,
     mmap: Mmap,
     header: FileHeader,
     /// Cache of table schemas and their indexes
@@ -62,7 +61,6 @@ impl Database {
         let mmap = unsafe { Mmap::map(&file)? };
         
         let mut db = Database { 
-            file, 
             mmap,
             header,
             schema_cache: HashMap::new(),
@@ -259,7 +257,7 @@ impl Database {
             return Err(Error::InvalidPage(page_number));
         }
         
-        let data = self.mmap[offset..offset + page_size].to_vec();
+        let data = &self.mmap[offset..offset + page_size];
         let page = Page::parse(page_number, data, page_number == 1)?;
         
         // For table scans, implement a more aggressive caching strategy
@@ -279,55 +277,6 @@ impl Database {
         Ok(page)
     }
     
-    /// Read multiple pages in a batch for better I/O efficiency
-    fn read_pages_batch(&mut self, page_numbers: &[u32]) -> Result<Vec<Page>> {
-        let mut pages = Vec::with_capacity(page_numbers.len());
-        let mut uncached_pages = Vec::new();
-        
-        // First, check cache for all pages
-        for &page_number in page_numbers {
-            if let Some(page) = self.page_cache.get(&page_number) {
-                pages.push(page.clone());
-                // Update LRU order
-                self.page_lru_order.retain(|&x| x != page_number);
-                self.page_lru_order.push(page_number);
-            } else {
-                uncached_pages.push(page_number);
-            }
-        }
-        
-        // Read uncached pages from memory-mapped file
-        for page_number in uncached_pages {
-            if page_number == 0 || page_number > self.header.database_size {
-                return Err(Error::InvalidPage(page_number));
-            }
-            
-            let offset = (page_number - 1) as usize * self.header.page_size as usize;
-            let page_size = self.header.page_size as usize;
-            
-            if offset + page_size > self.mmap.len() {
-                return Err(Error::InvalidPage(page_number));
-            }
-            
-            let data = self.mmap[offset..offset + page_size].to_vec();
-            let page = Page::parse(page_number, data, page_number == 1)?;
-            pages.push(page.clone());
-            
-            // Cache the page
-            if self.page_cache.len() >= self.max_cache_size {
-                if let Some(&oldest_page) = self.page_lru_order.first() {
-                    self.page_cache.remove(&oldest_page);
-                    self.page_lru_order.retain(|&x| x != oldest_page);
-                }
-            }
-            
-            self.page_cache.insert(page_number, page);
-            self.page_lru_order.push(page_number);
-        }
-        
-        Ok(pages)
-    }
-    
     /// List all tables in the database
     pub fn tables(&mut self) -> Result<Vec<String>> {
         let schema = self.read_schema()?;
@@ -341,8 +290,6 @@ impl Database {
             })
             .collect())
     }
-    
-
     
     /// Count rows in a table efficiently without reading all data
     pub fn count_table_rows(&mut self, table_name: &str) -> Result<usize> {
@@ -383,31 +330,6 @@ impl Database {
         
         log_debug(&format!("Counted {} rows in table {}", row_count, table_name));
         Ok(row_count)
-    }
-    
-    /// Estimate table rows based on database size and page information
-    #[allow(dead_code)]
-    fn estimate_table_rows(&mut self, _table_name: &str) -> Result<usize> {
-        // Get database size in pages
-        let total_pages = self.header.database_size;
-        let _page_size = self.header.page_size as usize;
-        
-        // Estimate based on typical SQLite table density
-        // Most SQLite tables use about 60-80% of available space
-        let avg_cells_per_page = 50; // Conservative estimate
-        let estimated_pages_for_table = total_pages / 3; // Assume table uses ~1/3 of database
-        
-        let estimated_rows = estimated_pages_for_table * avg_cells_per_page;
-        
-        // Add some variance based on actual database characteristics
-        let final_estimate = if total_pages > 10000 {
-            // For very large databases, be more conservative
-            (estimated_rows as f64 * 0.8) as usize
-        } else {
-            estimated_rows as usize
-        };
-        
-        Ok(final_estimate.max(1000)) // Ensure minimum reasonable estimate
     }
     
     /// Read the schema information
@@ -485,14 +407,6 @@ impl Database {
         let table_info = self.schema_cache.get(table_name)
             .ok_or_else(|| Error::TableNotFound(table_name.to_string()))?;
         Ok(table_info.columns.clone())
-    }
-
-    /// Get interned column name to avoid string allocations
-    fn intern_column_name(&mut self, name: &str) -> &str {
-        if !self.column_name_cache.contains_key(name) {
-            self.column_name_cache.insert(name.to_string(), name.to_string());
-        }
-        self.column_name_cache.get(name).unwrap()
     }
 
     /// Perform a streaming table scan that processes rows one at a time for better memory efficiency
@@ -705,12 +619,6 @@ impl Database {
         // Use batch processing for better performance
         self.read_all_table_rows_batch(table_name, limit)
     }
-
-    /// Perform a full table scan to read all rows
-    fn read_all_table_rows(&mut self, table_name: &str) -> Result<Vec<Row>> {
-        // Use the optimized version with no limit
-        self.read_all_table_rows_optimized(table_name, None)
-    }
     
     /// Find the INTEGER PRIMARY KEY column name for a table (if any)
     fn find_rowid_column(&self, table_name: &str) -> Result<Option<String>> {
@@ -814,7 +722,8 @@ impl Database {
         }
         
         // Convert rowids to a vec for deterministic ordering
-        let all_rowids: Vec<_> = all_rowids.into_iter().collect();
+        let mut all_rowids: Vec<_> = all_rowids.into_iter().collect();
+        all_rowids.sort(); // Ensure deterministic results
         let mut rows = Vec::with_capacity(all_rowids.len());
         
         // Fetch each matching row by its ROWID using targeted lookups

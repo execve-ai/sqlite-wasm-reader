@@ -19,7 +19,7 @@ pub struct Cell {
 
 /// An entry in an index B-tree
 #[derive(Debug)]
-pub struct IndexCell {
+struct IndexCell {
     /// The indexed value(s)
     pub key: Vec<Value>,
     /// The rowid of the corresponding row
@@ -28,7 +28,7 @@ pub struct IndexCell {
 
 /// An entry in an interior index page
 #[derive(Debug)]
-pub struct InteriorIndexCell {
+struct InteriorIndexCell {
     /// The page number of the left child.
     pub left_child: u32,
     /// The indexed value(s)
@@ -38,14 +38,12 @@ pub struct InteriorIndexCell {
 /// B-tree cursor for traversing pages
 pub struct BTreeCursor {
     /// Stack of pages being traversed
-    /// Each entry contains: (page, current_cell_index, cells_processed)
-    page_stack: Vec<(Page, usize, bool)>,
+    /// Each entry contains: (page, current_cell_index)
+    page_stack: Vec<(Page, usize)>,
     /// Track visited pages to prevent infinite loops
     visited_pages: Vec<u32>,
     /// Safety counter to prevent infinite loops
     iteration_count: usize,
-    /// Reusable cell buffer to reduce allocations
-    cell_buffer: Vec<u8>,
 }
 
 impl BTreeCursor {
@@ -53,10 +51,9 @@ impl BTreeCursor {
     pub fn new(root_page: Page) -> Self {
         let page_number = root_page.page_number;
         BTreeCursor {
-            page_stack: vec![(root_page, 0, false)],
+            page_stack: vec![(root_page, 0)],
             visited_pages: vec![page_number],
             iteration_count: 0,
-            cell_buffer: Vec::with_capacity(1024), // Pre-allocate buffer for cell data
         }
     }
     
@@ -134,7 +131,7 @@ impl BTreeCursor {
                 return Ok(None);
             }
             
-            let (page, cell_index, _cells_processed) = self.page_stack.last_mut().unwrap();
+            let (page, cell_index) = self.page_stack.last_mut().unwrap();
             
             // If this is a leaf page
             if page.page_type.is_leaf() {
@@ -204,7 +201,7 @@ impl BTreeCursor {
                     
                     let right_page = read_page(right_ptr)?;
                     self.visited_pages.push(right_ptr);
-                    self.page_stack.push((right_page, 0, false));
+                    self.page_stack.push((right_page, 0));
                     continue;
                 }
                 
@@ -268,7 +265,7 @@ impl BTreeCursor {
                         }
                     };
                     self.visited_pages.push(left_child);
-                    self.page_stack.push((child_page, 0, false));
+                    self.page_stack.push((child_page, 0));
                 }
             }
 

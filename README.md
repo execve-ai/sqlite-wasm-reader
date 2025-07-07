@@ -18,6 +18,9 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed release information.
 - **Robust B-tree Traversal**: Proper in-order traversal with cycle detection
 - **Memory Efficient**: Designed to handle large databases with limited memory constraints
 - **Simple API**: Easy-to-use interface for reading tables and data
+- **Deterministic Results**: Consistent query results across different runs and environments
+- **Robust Data Handling**: Graceful handling of edge cases like NaN values without runtime panics
+- **Performance Optimized**: Minimized memory allocations and optimized page parsing for better performance
 
 ## Why Read-Only?
 
@@ -471,6 +474,33 @@ match Database::open("database.db") {
     }
 }
 ```
+
+## Robustness Features
+
+The library is designed for production use with several robustness features:
+
+### **Deterministic Query Results**
+- Index-based queries return results in consistent, sorted order
+- No unpredictable row ordering that could cause flaky tests or inconsistent behavior
+- Reliable for applications that depend on consistent data presentation
+
+### **Robust Data Handling**
+- Graceful handling of NaN values in floating-point comparisons
+- No runtime panics on valid SQLite data
+- Proper error recovery for malformed records
+- Safe handling of edge cases and corrupted data
+
+### **Memory Safety**
+- Optimized memory usage with minimal allocations
+- Cycle detection in B-tree traversal to prevent infinite loops
+- Bounds checking to prevent buffer overflows
+- Safe handling of large databases with limited memory constraints
+
+### **Error Recovery**
+- Comprehensive error types for different failure scenarios
+- Graceful degradation when encountering problematic data
+- Detailed logging for debugging and monitoring
+- Safe fallbacks when optimal paths fail
 
 ## License
 

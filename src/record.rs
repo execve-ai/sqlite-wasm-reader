@@ -1,6 +1,6 @@
 //! SQLite record parsing
 
-use crate::{Error, Result, Value, btree::read_varint, logging::log_warn, logging::log_debug};
+use crate::{Error, Result, Value, btree::read_varint};
 use byteorder::{BigEndian, ByteOrder};
 
 #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]

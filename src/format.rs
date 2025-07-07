@@ -84,11 +84,6 @@ impl PageType {
     pub fn is_leaf(&self) -> bool {
         matches!(self, PageType::LeafIndex | PageType::LeafTable)
     }
-    
-    #[allow(dead_code)]
-    pub fn is_table(&self) -> bool {
-        matches!(self, PageType::InteriorTable | PageType::LeafTable)
-    }
 }
 
 #[cfg(test)]
@@ -125,19 +120,6 @@ mod tests {
         assert_eq!(format!("{:?}", PageType::LeafTable), "LeafTable");
         assert_eq!(format!("{:?}", PageType::InteriorIndex), "InteriorIndex");
         assert_eq!(format!("{:?}", PageType::LeafIndex), "LeafIndex");
-    }
-
-    #[test]
-    fn test_page_type_methods() {
-        assert!(PageType::InteriorTable.is_table());
-        assert!(PageType::LeafTable.is_table());
-        assert!(!PageType::InteriorIndex.is_table());
-        assert!(!PageType::LeafIndex.is_table());
-
-        assert!(!PageType::InteriorTable.is_leaf());
-        assert!(PageType::LeafTable.is_leaf());
-        assert!(!PageType::InteriorIndex.is_leaf());
-        assert!(PageType::LeafIndex.is_leaf());
     }
 
     #[test]
